@@ -28,8 +28,9 @@ def _default_dir() -> Path:
     override = os.environ.get("JARVIS_CONVERSATIONS_DIR")
     if override:
         return Path(override)
-    # server/conversations.py -> project root / conversations
-    return Path(__file__).resolve().parents[1] / "conversations"
+    from shared import paths
+
+    return paths.conversations_dir()
 
 
 def _json_default(obj):

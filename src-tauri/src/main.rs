@@ -2,7 +2,7 @@ use raw_window_handle::HasWindowHandle;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, State};
@@ -13,6 +13,9 @@ const MAIN_W: f64 = 427.0;
 const DEFAULT_GAP: f64 = 14.0;
 const DEFAULT_OPACITY: f64 = 0.72;
 const BACKEND_PORT: u16 = 8765;
+/// Must match `bundle.identifier` in tauri.conf.json: Tauri resolves
+/// `app_config_dir()` to `%APPDATA%\<bundle identifier>` on Windows.
+const APP_DIR_NAME: &str = "com.jarvis.assistant";
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct ModelSpec {
@@ -132,6 +135,54 @@ fn save_opacity(app: &tauri::AppHandle, opacity: f64) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(&p, format!("{}", opacity));
+}
+
+/// Per-user directory the Python backend writes to. Mirrors
+/// `app_config_dir()` so both sides of the app agree on one location.
+fn data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("JARVIS_DATA_DIR") {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    match std::env::var("APPDATA") {
+        Ok(appdata) if !appdata.trim().is_empty() => PathBuf::from(appdata).join(APP_DIR_NAME),
+        _ => std::env::current_dir()
+            .unwrap_or_default()
+            .join(".jarvis"),
+    }
+}
+
+/// Repository root, but only while running from source (dev mode).
+fn find_project_root() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let mut candidates = vec![cwd.clone()];
+    if let Some(parent) = cwd.parent() {
+        candidates.push(parent.to_path_buf());
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.join("server").join("main.py").is_file())
+}
+
+fn documents_dir() -> PathBuf {
+    std::env::var("USERPROFILE")
+        .map(|home| PathBuf::from(home).join("Documents"))
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
+}
+
+/// Agent working folder. Dev runs inside the repo; an installed build must
+/// never use the (read-only) install directory, so it falls back to
+/// `Documents\Jarvis`.
+fn default_workdir() -> PathBuf {
+    find_project_root().unwrap_or_else(|| documents_dir().join("Jarvis"))
+}
+
+fn load_config_at(dir: &Path) -> AppConfig {
+    std::fs::read_to_string(dir.join("api_keys.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 struct PythonServer(Option<Child>);
@@ -272,7 +323,7 @@ fn center_on_primary_monitor(app: &tauri::AppHandle, w: f64, h: f64) -> Option<(
     Some((x.round() as i32, y.round() as i32))
 }
 
-fn start_python_backend(server_py: &PathBuf) -> Option<Child> {
+fn start_python_backend(server_py: &Path, data_dir: &Path, workdir: &Path) -> Option<Child> {
     if port_is_open(BACKEND_PORT) {
         // A previous run that was killed with Ctrl+C leaves its python child
         // alive on the port; during development we take the port back instead
@@ -297,7 +348,14 @@ fn start_python_backend(server_py: &PathBuf) -> Option<Child> {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
         let mut cmd = Command::new(bin);
-        let child = cmd.arg(server_py).current_dir(current_dir).spawn();
+        let child = cmd
+            .arg(server_py)
+            .current_dir(current_dir)
+            .env("JARVIS_DATA_DIR", data_dir)
+            .env("JARVIS_WORKDIR", workdir)
+            .env("PYTHONUTF8", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .spawn();
 
         match child {
             Ok(child) => {
@@ -589,10 +647,7 @@ fn get_workdir(app: tauri::AppHandle) -> String {
     if let Some(w) = cfg.workdir {
         return w;
     }
-    match std::env::current_dir() {
-        Ok(p) => p.display().to_string(),
-        Err(_) => String::new(),
-    }
+    default_workdir().display().to_string()
 }
 
 #[tauri::command]
@@ -611,20 +666,17 @@ fn set_workdir(path: String, app: tauri::AppHandle) -> Result<String, String> {
 }
 
 fn main() {
-    let cwd = std::env::current_dir().expect("failed to get current dir");
+    let server_py = find_project_root().map(|p| p.join("server").join("main.py"));
 
-    let server_py = [
-        cwd.clone(),
-        cwd.parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| cwd.clone()),
-    ]
-    .iter()
-    .map(|p| p.join("server").join("main.py"))
-    .find(|p| p.exists());
+    let data = data_dir();
+    let _ = std::fs::create_dir_all(&data);
+    let workdir = load_config_at(&data)
+        .workdir
+        .map(PathBuf::from)
+        .unwrap_or_else(default_workdir);
 
     let python = match server_py {
-        Some(ref server_py) => start_python_backend(server_py),
+        Some(ref server_py) => start_python_backend(server_py, &data, &workdir),
         None => {
             eprintln!("[backend] server/main.py not found, UI will still open");
             None

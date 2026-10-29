@@ -9,7 +9,6 @@ import re
 import shutil
 import tempfile
 import threading
-from pathlib import Path
 
 from shared.tasks import TaskType
 from shared import agent_job
@@ -18,7 +17,14 @@ from .registry import Tool, ToolResult, VerificationStatus
 
 logger = logging.getLogger("shell")
 
-PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
+
+def _workspace() -> str:
+    """Folder agent shell commands run in (user-configurable, see shared/paths.py)."""
+    from shared import paths
+
+    return str(paths.workspace_dir())
+
+
 _PS_FALLBACK = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.EXE"
 
 _CLIXML_OBJ = re.compile(r"<Objs\b.*?</Objs>", re.DOTALL)
@@ -134,7 +140,7 @@ def _execute_ps(command: str, timeout: int = 60) -> ToolResult:
                 shell_exe, '-NoProfile', '-NonInteractive',
                 '-ExecutionPolicy', 'Bypass', '-File', wrapper_ps1,
             ],
-            cwd=PROJECT_ROOT,
+            cwd=_workspace(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -242,7 +248,7 @@ def _execute_cmd(command: str) -> ToolResult:
     try:
         proc = subprocess.Popen(
             ["cmd", "/c", command],
-            cwd=PROJECT_ROOT,
+            cwd=_workspace(),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

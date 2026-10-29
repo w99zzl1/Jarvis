@@ -5,10 +5,11 @@ import json
 import time
 import threading
 import subprocess
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 from typing import Optional, Callable, Dict, List
 from queue import Queue
+
+from shared import paths
 
 from .task import Task, TaskStatus, TaskType, new_task
 from .progress_parser import parse_line
@@ -36,7 +37,7 @@ class TaskManager:
         self._tasks: Dict[str, Task] = {}
         self._futures: Dict[str, Future] = {}
         self._executor = ThreadPoolExecutor(max_workers=_max_workers)
-        self._persist_path = Path("memory_store.json").resolve()
+        self._persist_path = paths.tasks_history_file()
         self._persist_lock = threading.Lock()
         self._sse_clients: List[Queue] = []
         self._sse_lock = threading.Lock()
@@ -55,7 +56,7 @@ class TaskManager:
     # ── Persistence ────────────────────────────────────────────────────────────
 
     def _load(self):
-        path = self._persist_path.with_name("tasks_history.json")
+        path = self._persist_path
         if path.exists():
             try:
                 with open(path, 'r', encoding='utf-8') as f:
@@ -68,7 +69,7 @@ class TaskManager:
 
     def _save(self):
         with self._persist_lock:
-            path = self._persist_path.with_name("tasks_history.json")
+            path = self._persist_path
             try:
                 tasks_data = [t.to_dict() for t in self._tasks.values()]
                 with open(path, 'w', encoding='utf-8') as f:

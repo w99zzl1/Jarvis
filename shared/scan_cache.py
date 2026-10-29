@@ -7,8 +7,9 @@ the exact absolute path of the node, and shipping every path to the model would
 burn the context window on the listing nobody reads.
 
 So the raw entry list is parked here instead - in memory for the session and
-mirrored to `.tmp/last_scan.json` so a restart keeps the knowledge. File tools
-resolve short references against it (see `agents/code/tools/base.py`).
+mirrored to `cache/last_scan.json` under the app data directory so a restart
+keeps the knowledge. File tools resolve short references against it
+(see `agents/code/tools/base.py`).
 
 Design rules:
 
@@ -260,8 +261,9 @@ class ScanCache:
     def cache_file(self) -> str:
         if self._cache_file:
             return self._cache_file
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        return os.path.join(root, ".tmp", "last_scan.json")
+        from shared import paths
+
+        return str(paths.cache_dir() / "last_scan.json")
 
     def record(self, scan) -> LastScan:
         """Store the raw entry list of a finished `shared.disk_scan.Scan`."""

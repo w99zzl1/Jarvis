@@ -25,7 +25,6 @@ MAX_EXECUTION_TIME_DEFAULT = 60
 # the model unable to read the entries it had just asked for — and with the
 # duplicate call replayed as a stub it had no way to recover.
 TOOL_OUTPUT_LIMIT = 6000
-TRACE_DIR = "traces"
 
 
 class AgentState(Enum):
@@ -119,8 +118,10 @@ class ExecutionTrace:
         self.total_time = round(total_time, 3)
 
     def save(self):
-        os.makedirs(TRACE_DIR, exist_ok=True)
-        path = os.path.join(TRACE_DIR, f"{self.trace_id}.json")
+        from shared import paths
+
+        trace_dir = str(paths.traces_dir())
+        path = os.path.join(trace_dir, f"{self.trace_id}.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump({
                 "trace_id": self.trace_id,

@@ -20,7 +20,9 @@ class MemoryStore:
         if self._loaded:
             return
         self._loaded = True
-        self._file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "memory_store.json")
+        from shared import paths
+
+        self._file = str(paths.memory_file())
         self._data: list[dict] = []
         self._load()
 

@@ -31,9 +31,9 @@ from typing import List, Tuple
 
 log = logging.getLogger("file_index")
 
-_CACHE_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_file_index"
-)
+from shared import paths
+
+_CACHE_DIR = str(paths.file_index_dir())
 _INDEX_PATH = os.path.join(_CACHE_DIR, "index.pkl.gz")
 _META_PATH = os.path.join(_CACHE_DIR, "index_meta.json")
 _TMP_PATH = _INDEX_PATH + ".tmp"

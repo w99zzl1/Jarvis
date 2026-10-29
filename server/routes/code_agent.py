@@ -158,7 +158,9 @@ def _map_to_sse_event(internal_event: dict) -> dict | None:
 
 
 def _project_root() -> str:
-    return str(Path(__file__).resolve().parents[2])
+    from shared import paths
+
+    return str(paths.workspace_dir())
 
 
 def list_code_tools() -> list[dict]:

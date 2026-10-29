@@ -23,6 +23,8 @@ import os
 import threading
 import time
 
+from shared import paths
+
 logger = logging.getLogger("location")
 
 # Only these two are needed; the first that answers wins.
@@ -39,8 +41,6 @@ HTTP_TIMEOUT = 4               # seconds; never stall a turn on this
 EXACT = "exact"        # the user stated it
 INFERRED = "inferred"  # derived from public IP, possibly a VPN
 UNKNOWN = "unknown"    # nothing usable
-
-_CF = "shared/location_cache.json"
 
 
 class Location:
@@ -98,8 +98,7 @@ class Location:
 
 
 def _cache_path() -> str:
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(root, _CF)
+    return str(paths.location_cache_file())
 
 
 def _read_cache() -> dict:

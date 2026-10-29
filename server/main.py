@@ -23,6 +23,7 @@ from routes.code_agent import code_chat_route, code_chat_stream
 from shared.llm_client.model_fetcher import check_connected_providers_and_fetch_models, fetch_provider_models
 from shared.config_loader import get_selected_models
 from shared import agent_job
+from shared import paths as _paths
 
 log = logging.getLogger("server")
 
@@ -85,7 +86,7 @@ async def delete_conversation(conversation_id: str):
 # File uploads (drag-drop / paste attachments from UI)
 # ============================================================================
 
-_UPLOAD_DIR = os.path.join(_root, "uploads")
+_UPLOAD_DIR = str(_paths.uploads_dir())
 
 
 def _ensure_upload_dir():
@@ -95,7 +96,7 @@ def _ensure_upload_dir():
 
 @app.post("/upload")
 async def upload_files(files: List[UploadFile] = File(...)):
-    """Save uploaded files to server/uploads and return file info for the UI."""
+    """Save uploaded files to the uploads dir and return file info for the UI."""
     _ensure_upload_dir()
     saved = []
     for f in files:

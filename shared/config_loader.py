@@ -1,24 +1,18 @@
-import os
-import pathlib
-import logging
 import json
+import logging
+
+from shared import paths
 
 log = logging.getLogger("config_loader")
 
+
 def get_config_dir():
-    # Исправляем путь: Tauri использует com.jarvis.assistant
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        # Пытаемся найти папку, которую реально использует Tauri
-        path = pathlib.Path(appdata) / "com.jarvis.assistant"
-        if not path.exists():
-            # Если такой нет, fallback на старую логику или создание
-            path = pathlib.Path(appdata) / "jarvis"
-        return path
-    return pathlib.Path.cwd() 
+    # Единый каталог данных: %APPDATA%\com.jarvis.assistant (см. shared/paths.py).
+    return paths.app_dir()
+
 
 def get_api_keys():
-    p = get_config_dir() / "api_keys.json"
+    p = paths.api_keys_file()
     if p.exists():
         try:
             data = json.loads(p.read_text())
@@ -31,7 +25,7 @@ def get_api_keys():
 
 def get_app_config():
     """Весь конфиг Tauri (api_keys + выбранные модели) из api_keys.json."""
-    p = get_config_dir() / "api_keys.json"
+    p = paths.api_keys_file()
     if p.exists():
         try:
             data = json.loads(p.read_text())

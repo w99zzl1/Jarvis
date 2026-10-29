@@ -5,7 +5,8 @@ import JarvisCore from "./components/JarvisCore";
 import ChatPanel from "./components/ChatPanel";
 import Dashboard from "./components/Dashboard";
 import VoiceButton from "./components/VoiceButton";
-import { sendVoiceChat, playAudioFromBase64 } from "./api";
+import { sendVoiceChat, playAudioFromBase64, getBackendStatus } from "./api";
+import type { BackendStatus } from "./api";
 
 import {
   emit,
@@ -206,6 +207,15 @@ export default function App() {
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
 
+  // Local Python backend: Rust launches it and watches /health. A packaged
+  // build has no console, so a failure has to show up here instead.
+  const [backend, setBackend] = useState<BackendStatus>({
+    ready: false,
+    failed: false,
+    message: "",
+    mode: "",
+  });
+
   // ==========================================================
   // VIEW
   // ==========================================================
@@ -233,6 +243,19 @@ export default function App() {
     return () => {
       unlistenOpacity.then(u => u());
       unlistenAssistant.then(u => u());
+    };
+  }, []);
+
+  // Backend status: ask once on mount, then follow the Rust watchdog.
+  useEffect(() => {
+    getBackendStatus().then(setBackend).catch(() => {});
+
+    const unlisten = listen<BackendStatus>("backend-status", (event: any) => {
+      setBackend(event.payload);
+    });
+
+    return () => {
+      unlisten.then(u => u());
     };
   }, []);
 
@@ -638,7 +661,7 @@ if (isSettingsView) {
           >
             <motion.p
               style={{
-                color: CYAN,
+                color: backend.failed ? "#FF5C7A" : CYAN,
                 letterSpacing: "0.46em",
                 fontSize: "9.5px",
                 opacity: 0.4,
@@ -662,7 +685,11 @@ if (isSettingsView) {
                 ? "SPEAKING"
                 : isListening
                 ? "LISTENING"
-                : "SYSTEM ONLINE"}
+                : backend.failed
+                ? "BACKEND OFFLINE"
+                : backend.ready
+                ? "SYSTEM ONLINE"
+                : "STARTING BACKEND"}
             </motion.p>
 
             <h1
@@ -680,6 +707,31 @@ if (isSettingsView) {
               JARVIS
             </h1>
           </div>
+
+          {backend.failed && (
+            <div
+              data-no-drag
+              title={backend.message}
+              style={{
+                width: "100%",
+                margin: "4px 0 6px",
+                padding: "6px 8px",
+                border: "1px solid rgba(255,92,122,0.5)",
+                background: "rgba(255,92,122,0.07)",
+                color: "rgba(255,196,206,0.9)",
+                fontFamily: MONO,
+                fontSize: "9px",
+                lineHeight: 1.45,
+                textAlign: "center",
+                overflow: "hidden",
+                display: "-webkit-box",
+                WebkitLineClamp: 3,
+                WebkitBoxOrient: "vertical",
+              }}
+            >
+              {backend.message || "The local backend is not running."}
+            </div>
+          )}
 
           {/* CORE */}
 

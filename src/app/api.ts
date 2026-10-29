@@ -128,6 +128,24 @@ export interface ChatResponse {
 
 export interface HealthResponse {
   status: string;
+  service?: string;
+  data_dir?: string;
+  workspace?: string;
+}
+
+/**
+ * Backend state tracked by the Tauri shell. A packaged app starts the Python
+ * child itself, so only Rust knows why it failed (missing runtime, blocked by
+ * antivirus, port taken) - the UI just renders this.
+ */
+export interface BackendStatus {
+  /** /health answered 200. */
+  ready: boolean;
+  /** Startup failed, or the backend stopped answering. */
+  failed: boolean;
+  message: string;
+  /** "dev" | "bundled" | "none" */
+  mode: string;
 }
 
 // ============================================================================
@@ -374,6 +392,11 @@ export async function sendMainChatStreaming(
 
 export async function healthCheck(): Promise<HealthResponse> {
   return apiFetch<HealthResponse>("/health");
+}
+
+/** Backend state as seen by Rust (works even when the API is unreachable). */
+export async function getBackendStatus(): Promise<BackendStatus> {
+  return invoke<BackendStatus>("backend_status");
 }
 
 export async function startListening(): Promise<void> {

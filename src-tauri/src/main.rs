@@ -1,10 +1,12 @@
 use raw_window_handle::HasWindowHandle;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, State};
 
 const ASSISTANT_W: f64 = 1152.0;
@@ -41,6 +43,18 @@ struct AppConfig {
     disabled_tools: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct BackendStatus {
+    /// `/health` answered 200 - the UI can talk to the API.
+    ready: bool,
+    /// Startup failed or an established backend stopped answering.
+    failed: bool,
+    /// Human readable reason, shown in the UI when `failed` is true.
+    message: String,
+    /// "dev" (python from PATH) or "bundled" (interpreter from $RESOURCE).
+    mode: String,
+}
+
 struct AppState {
     gap: Mutex<f64>,
     opacity: Mutex<f64>,
@@ -50,6 +64,7 @@ struct AppState {
     /// Restoring the desktop has to bring back exactly what was there.
     settings_before_console: Mutex<bool>,
     config: Mutex<AppConfig>,
+    backend: Mutex<BackendStatus>,
 }
 
 fn config_path(app: &tauri::AppHandle) -> PathBuf {
@@ -185,15 +200,164 @@ fn load_config_at(dir: &Path) -> AppConfig {
         .unwrap_or_default()
 }
 
-struct PythonServer(Option<Child>);
+/// Owns the backend process. Dropping it (app exit) stops the server.
+struct PythonServer(Mutex<Option<Child>>);
 
 impl Drop for PythonServer {
     fn drop(&mut self) {
-        if let Some(ref mut child) = self.0 {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Ok(mut guard) = self.0.lock() {
+            if let Some(ref mut child) = *guard {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
+}
+
+/// One way of launching the backend: what to run, with which entry point.
+struct BackendCommand {
+    program: PathBuf,
+    server_py: PathBuf,
+    cwd: PathBuf,
+    mode: &'static str,
+}
+
+/// Resolve the backend for this build.
+///
+/// Dev: `python` (or the `py` launcher) from PATH with `server/main.py` in the
+/// checkout. Packaged: the embeddable interpreter and the copied sources under
+/// `$RESOURCE\backend` - the installer ships both, nothing is installed system
+/// wide and the user does not need Python.
+fn resolve_backend(app: &tauri::AppHandle) -> Result<Vec<BackendCommand>, String> {
+    if let Some(root) = find_project_root() {
+        let server_py = root.join("server").join("main.py");
+        let cwd = root.join("server");
+        return Ok(vec![
+            BackendCommand {
+                program: PathBuf::from("python"),
+                server_py: server_py.clone(),
+                cwd: cwd.clone(),
+                mode: "dev",
+            },
+            BackendCommand {
+                program: PathBuf::from("py"),
+                server_py,
+                cwd,
+                mode: "dev",
+            },
+        ]);
+    }
+
+    let base = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("Cannot resolve the app resource directory: {}", e))?
+        .join("backend");
+    let program = base.join("python").join("python.exe");
+    let server_py = base.join("app").join("server").join("main.py");
+
+    if !program.is_file() {
+        return Err(format!(
+            "Bundled Python runtime is missing ({}). Reinstall Jarvis, or check that antivirus did not quarantine it.",
+            program.display()
+        ));
+    }
+    if !server_py.is_file() {
+        return Err(format!(
+            "Backend sources are missing ({}). The installation looks incomplete; reinstall Jarvis.",
+            server_py.display()
+        ));
+    }
+
+    Ok(vec![BackendCommand {
+        program,
+        server_py,
+        cwd: base.join("app"),
+        mode: "bundled",
+    }])
+}
+
+/// GET /health over a raw socket: the backend is up only when it answers.
+fn backend_healthy() -> bool {
+    let addr = match format!("127.0.0.1:{}", BACKEND_PORT).parse() {
+        Ok(addr) => addr,
+        Err(_) => return false,
+    };
+    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(700)) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(1500)));
+    if stream
+        .write_all(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = [0u8; 32];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 12 => {
+            let head = String::from_utf8_lossy(&buf[..n]);
+            head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+        }
+        _ => false,
+    }
+}
+
+fn backend_log_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("backend.log")
+}
+
+/// Keep the UI informed about the backend without blocking startup.
+fn spawn_backend_watchdog(app: tauri::AppHandle, launched: bool, mut status: BackendStatus) {
+    std::thread::spawn(move || {
+        let mut announced_healthy = false;
+        let deadline = Instant::now() + Duration::from_secs(60);
+
+        if !launched {
+            status.failed = true;
+            push_backend_status(&app, status);
+            return;
+        }
+
+        loop {
+            let healthy = backend_healthy();
+
+            if healthy && !status.ready {
+                status.ready = true;
+                status.failed = false;
+                status.message.clear();
+                announced_healthy = true;
+                push_backend_status(&app, status.clone());
+            } else if !healthy && announced_healthy && !status.failed {
+                status.ready = false;
+                status.failed = true;
+                status.message = "The local backend stopped responding. Close and reopen Jarvis; \
+                     if it keeps happening, see backend.log in the app data folder."
+                    .to_string();
+                push_backend_status(&app, status.clone());
+            } else if !healthy && !announced_healthy && Instant::now() >= deadline && !status.failed {
+                status.failed = true;
+                status.message = "The local backend did not start within 60 seconds. \
+                     Antivirus software sometimes blocks backend\\python\\python.exe; \
+                     see backend.log in the app data folder."
+                    .to_string();
+                push_backend_status(&app, status.clone());
+            }
+
+            std::thread::sleep(Duration::from_millis(if announced_healthy { 5000 } else { 500 }));
+        }
+    });
+}
+
+fn push_backend_status(app: &tauri::AppHandle, status: BackendStatus) {
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(mut guard) = state.backend.lock() {
+            *guard = status.clone();
+        }
+    }
+    let _ = app.emit("backend-status", status);
 }
 
 fn port_is_open(port: u16) -> bool {
@@ -323,53 +487,143 @@ fn center_on_primary_monitor(app: &tauri::AppHandle, w: f64, h: f64) -> Option<(
     Some((x.round() as i32, y.round() as i32))
 }
 
-fn start_python_backend(server_py: &Path, data_dir: &Path, workdir: &Path) -> Option<Child> {
+fn start_python_backend(
+    commands: &[BackendCommand],
+    data_dir: &Path,
+    workdir: &Path,
+) -> (Option<Child>, BackendStatus) {
+    let mode = commands
+        .first()
+        .map(|c| c.mode)
+        .unwrap_or("none")
+        .to_string();
+
     if port_is_open(BACKEND_PORT) {
         // A previous run that was killed with Ctrl+C leaves its python child
         // alive on the port; during development we take the port back instead
-        // of silently attaching to an orphan.
+        // of silently attaching to an orphan. A packaged build leaves a foreign
+        // process alone and reports it, so we never kill an unrelated server.
         if cfg!(debug_assertions) {
             stop_stale_backend(BACKEND_PORT);
         }
 
         if port_is_open(BACKEND_PORT) {
-            eprintln!(
-                "[backend] 127.0.0.1:{} already in use, reusing existing server",
+            if backend_healthy() {
+                eprintln!(
+                    "[backend] 127.0.0.1:{} already serves a healthy backend, reusing it",
+                    BACKEND_PORT
+                );
+                return (
+                    None,
+                    BackendStatus {
+                        ready: true,
+                        failed: false,
+                        message: String::new(),
+                        mode,
+                    },
+                );
+            }
+
+            let message = format!(
+                "Port {} is already used by another program, so the local backend cannot start. \
+                 Close that program and reopen Jarvis.",
                 BACKEND_PORT
             );
-            return None;
+            eprintln!("[backend] {}", message);
+            return (
+                None,
+                BackendStatus {
+                    ready: false,
+                    failed: true,
+                    message,
+                    mode,
+                },
+            );
         }
     }
 
-    let candidates = ["python", "py"];
-    for bin in candidates {
-        let current_dir = server_py
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let mut cmd = Command::new(bin);
-        let child = cmd
-            .arg(server_py)
-            .current_dir(current_dir)
+    // Python tracebacks are invisible in a GUI build: keep them in a file the
+    // error message can point the user at.
+    let log_path = backend_log_path(data_dir);
+    if let Ok(mut header) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let _ = writeln!(header, "\n--- jarvis backend start ---");
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .ok();
+
+    let mut last_error = String::new();
+    for spec in commands {
+        let mut cmd = Command::new(&spec.program);
+        cmd.arg(&spec.server_py)
+            .current_dir(&spec.cwd)
             .env("JARVIS_DATA_DIR", data_dir)
             .env("JARVIS_WORKDIR", workdir)
             .env("PYTHONUTF8", "1")
             .env("PYTHONIOENCODING", "utf-8")
-            .spawn();
+            .stdin(Stdio::null());
 
-        match child {
+        if let Some(file) = &log {
+            if let Ok(copy) = file.try_clone() {
+                cmd.stdout(Stdio::from(copy));
+            }
+            if let Ok(copy) = file.try_clone() {
+                cmd.stderr(Stdio::from(copy));
+            }
+        }
+
+        match cmd.spawn() {
             Ok(child) => {
-                eprintln!("[backend] started {} {}", bin, server_py.display());
-                return Some(child);
+                eprintln!(
+                    "[backend] started {} {} ({}, log: {})",
+                    spec.program.display(),
+                    spec.server_py.display(),
+                    spec.mode,
+                    backend_log_path(data_dir).display()
+                );
+                return (
+                    Some(child),
+                    BackendStatus {
+                        ready: false,
+                        failed: false,
+                        message: String::new(),
+                        mode,
+                    },
+                );
             }
             Err(err) => {
-                eprintln!("[backend] failed to start {}: {}", bin, err);
+                eprintln!(
+                    "[backend] failed to start {}: {}",
+                    spec.program.display(),
+                    err
+                );
+                last_error = err.to_string();
             }
         }
     }
 
-    eprintln!("[backend] unable to start Python backend, UI will still open");
-    None
+    let message = format!(
+        "The local backend could not be started ({}). Reinstall Jarvis; if antivirus \
+         quarantined backend\\python\\python.exe, restore it. Details: {}",
+        last_error,
+        backend_log_path(data_dir).display()
+    );
+    eprintln!("[backend] {}", message);
+    (
+        None,
+        BackendStatus {
+            ready: false,
+            failed: true,
+            message,
+            mode,
+        },
+    )
 }
 
 #[tauri::command]
@@ -665,28 +919,48 @@ fn set_workdir(path: String, app: tauri::AppHandle) -> Result<String, String> {
     Ok(path)
 }
 
+#[tauri::command]
+fn backend_status(state: State<AppState>) -> BackendStatus {
+    state
+        .backend
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_else(|_| BackendStatus {
+            ready: false,
+            failed: true,
+            message: "Backend state is unavailable.".to_string(),
+            mode: String::new(),
+        })
+}
+
 fn main() {
-    let server_py = find_project_root().map(|p| p.join("server").join("main.py"));
-
-    let data = data_dir();
-    let _ = std::fs::create_dir_all(&data);
-    let workdir = load_config_at(&data)
-        .workdir
-        .map(PathBuf::from)
-        .unwrap_or_else(default_workdir);
-
-    let python = match server_py {
-        Some(ref server_py) => start_python_backend(server_py, &data, &workdir),
-        None => {
-            eprintln!("[backend] server/main.py not found, UI will still open");
-            None
-        }
-    };
-
-    let _guard = PythonServer(python);
-
     tauri::Builder::default()
         .setup(|app| {
+            let data = data_dir();
+            let _ = std::fs::create_dir_all(&data);
+            let workdir = load_config_at(&data)
+                .workdir
+                .map(PathBuf::from)
+                .unwrap_or_else(default_workdir);
+
+            let (child, status) = match resolve_backend(app.handle()) {
+                Ok(commands) => start_python_backend(&commands, &data, &workdir),
+                Err(message) => {
+                    eprintln!("[backend] {}", message);
+                    (
+                        None,
+                        BackendStatus {
+                            ready: false,
+                            failed: true,
+                            message,
+                            mode: "none".to_string(),
+                        },
+                    )
+                }
+            };
+            let launched = child.is_some();
+            app.manage(PythonServer(Mutex::new(child)));
+
             let config = load_config(app.handle());
             let gap = load_gap(app.handle());
             let opacity = load_opacity(app.handle());
@@ -698,7 +972,11 @@ fn main() {
                 settings_visible: Mutex::new(false),
                 settings_before_console: Mutex::new(false),
                 config: Mutex::new(config),
+                backend: Mutex::new(status.clone()),
             });
+
+            // Started after AppState exists so the first status update lands.
+            spawn_backend_watchdog(app.handle().clone(), launched, status);
 
             let _js = format!(
                 "document.querySelectorAll('[data-panel-bg]').forEach(function(e){{e.style.background='rgba(1, 4, 8, {})}});",
@@ -752,6 +1030,7 @@ fn main() {
             set_config,
             get_workdir,
             set_workdir,
+            backend_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,0 +1,27 @@
+# Runtime dependencies of the Python backend, installed into the bundled
+# embeddable interpreter by scripts/build_backend.ps1.
+#
+# Python 3.10 x64. Versions are pinned to the ones the app is developed and
+# tested against; bump them together and re-run the packaging build.
+#
+# Deliberately NOT here:
+#   openai-whisper      - speech-to-text is not shipped (/stt/start is not
+#                         implemented); it also pulls in torch (~2 GB).
+#   google-generativeai - legacy SDK; the code uses the newer google-genai.
+#   google-api-python-client, requests-html, google_search_results - leftovers
+#                         from earlier experiments, nothing imports them.
+
+fastapi==0.136.3
+uvicorn==0.48.0
+pydantic==2.13.4
+python-multipart==0.0.32
+
+httpx==0.28.1
+requests==2.34.2
+
+openai==2.26.0
+groq==1.2.0
+google-genai==2.6.0
+
+beautifulsoup4==4.14.3
+ddgs==9.14.4

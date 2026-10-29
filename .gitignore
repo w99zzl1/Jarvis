@@ -5,7 +5,16 @@ dist/
 src-tauri/target/
 src-tauri/gen/schemas/
 native/**/target/
-backend-dist/
+
+# Built backend: only its placeholder stays in git so Tauri's resource path
+# exists on a fresh clone (scripts/build_backend.ps1 fills it in).
+/backend-dist/*
+!/backend-dist/backend/
+/backend-dist/backend/*
+!/backend-dist/backend/README.md
+
+# Downloaded embeddable Python / get-pip.py
+.cache/
 
 # --- Python ---
 # Local build of native/jarvis-disk (contains absolute build paths).

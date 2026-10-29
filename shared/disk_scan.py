@@ -87,8 +87,15 @@ def candidate_paths() -> list[Path]:
         out.extend([root / _PYD_NAME, root / "binaries" / _PYD_NAME,
                     root / "Jarvis" / _PYD_NAME, root / "lib" / _PYD_NAME])
 
+    # Packaged layout: backend\python\python.exe and backend\app\jarvis_disk.pyd.
+    if exe:
+        out.append(exe.parent / "app" / _PYD_NAME)
+
     root = _project_root()
-    out.extend([root / _PYD_NAME, root / "src-tauri" / "binaries" / _PYD_NAME])
+    out.extend([
+        root / _PYD_NAME,
+        root / "backend-dist" / "backend" / "app" / _PYD_NAME,
+    ])
 
     seen: set[str] = set()
     unique: list[Path] = []
@@ -164,8 +171,8 @@ def load_scanner():
     raise ScannerMissing(
         "Native disk scanner (jarvis_disk) is not available. Build it with:\n"
         "  powershell -ExecutionPolicy Bypass -File scripts/build_disk_scan.ps1\n"
-        "It produces jarvis_disk.pyd next to the project root and in "
-        "src-tauri/binaries (the folder bundled into the installer). Set "
+        "It produces jarvis_disk.pyd in the project root (dev) and in "
+        "backend-dist/backend/app (the folder bundled into the installer). Set "
         f"{_ENV_VAR}=<path to jarvis_disk.pyd> to point at a copy elsewhere.\n"
         f"Looked in: {', '.join(str(p) for p in candidate_paths()[:6])}"
         + (f"; loaded candidates: {', '.join(tried)}" if tried else "")

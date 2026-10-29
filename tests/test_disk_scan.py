@@ -677,23 +677,23 @@ def run_all(tmp):
     conf_path = os.path.join(REPO, "src-tauri", "tauri.conf.json")
     with open(conf_path, encoding="utf-8") as fh:
         conf = json.load(fh)
-    check("the tauri bundle ships the scanner",
-          "binaries/*" in json.dumps(conf.get("bundle", {}).get("resources")),
-          conf.get("bundle", {}).get("resources"))
+    resources = json.dumps(conf.get("bundle", {}).get("resources"))
+    check("the tauri bundle ships the staged backend",
+          "backend-dist" in resources and "backend" in resources, resources)
     script = os.path.join(REPO, "scripts", "build_disk_scan.ps1")
     with open(script, encoding="utf-8") as fh:
         script_text = fh.read()
-    check("the build script installs into the bundle folder",
-          "src-tauri\\binaries" in script_text and "jarvis_disk.pyd" in script_text)
-    bundled_pyd = os.path.join(REPO, "src-tauri", "binaries", "jarvis_disk.pyd")
+    check("the build script installs into the staged backend",
+          "backend-dist\\backend\\app" in script_text and "jarvis_disk.pyd" in script_text)
+    bundled_pyd = os.path.join(REPO, "backend-dist", "backend", "app", "jarvis_disk.pyd")
     check("the bundled .pyd exists", os.path.exists(bundled_pyd), bundled_pyd)
     if os.path.exists(bundled_pyd):
         check("the bundled .pyd is a real module",
               hasattr(disk_scan._load_extension(__import__("pathlib").Path(bundled_pyd)),
                       "scan_disk"))
     cands = [str(p).lower() for p in disk_scan.candidate_paths()]
-    check("load_scanner knows the tauri resource folder",
-          any("binaries" in c for c in cands), cands[:8])
+    check("load_scanner knows the packaged backend folder",
+          any(os.path.join("backend", "app") in c for c in cands), cands[:8])
     check("load_scanner honours the env override",
           cands[0].endswith(".pyd") or "jarvis_disk" in cands[0], cands[0])
     check("scanner_location reports where it came from",

@@ -49,6 +49,23 @@ async def startup_event():
 class FetchModelsRequest(BaseModel):
     api_keys: Optional[Any] = None
 
+
+@app.get("/health")
+async def health():
+    """Liveness probe used by the Tauri shell to report backend problems.
+
+    Deliberately trivial: it must answer even when no API key is configured,
+    because the UI needs to distinguish "backend did not start" from "model
+    provider is not reachable".
+    """
+    return {
+        "status": "ok",
+        "service": "jarvis-backend",
+        "data_dir": str(_paths.app_dir()),
+        "workspace": str(_paths.workspace_dir()),
+    }
+
+
 @app.post("/models/fetch")
 @app.get("/models/live")
 async def get_live_models(req: Optional[FetchModelsRequest] = None):

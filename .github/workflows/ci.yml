@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONUTF8: "1"
+
+jobs:
+  frontend:
+    name: Frontend (build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+  python:
+    name: Python (path and disk-scan checks)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install backend dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Path contract
+        run: python tests/test_paths.py
+
+      - name: Import the backend
+        run: python -c "import server.main; print('server import OK')"
+
+  rust:
+    name: Rust (check and tests)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # bundle.resources points at backend-dist/backend. Only the placeholder
+      # README is committed, but Tauri refuses to compile when the path is
+      # missing, so the directory must exist.
+      - name: Ensure the staged backend directory exists
+        run: |
+          if (-not (Test-Path "backend-dist\backend")) {
+              New-Item -ItemType Directory -Path "backend-dist\backend" -Force | Out-Null
+          }
+
+      - name: cargo check
+        working-directory: src-tauri
+        run: cargo check --locked
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --locked
+
+  native:
+    name: Native scanner (build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/jarvis-disk -> target
+
+      - name: Build jarvis_disk.pyd
+        run: powershell -ExecutionPolicy Bypass -File scripts/build_disk_scan.ps1
+
+      - name: Import the scanner
+        run: python -c "import jarvis_disk; print(jarvis_disk.__doc__ or 'jarvis_disk OK')"

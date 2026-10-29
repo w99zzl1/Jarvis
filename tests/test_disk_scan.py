@@ -685,12 +685,16 @@ def run_all(tmp):
         script_text = fh.read()
     check("the build script installs into the staged backend",
           "backend-dist\\backend\\app" in script_text and "jarvis_disk.pyd" in script_text)
+    # The staged backend is generated (git-ignored), so on a fresh clone only
+    # the folder layout and the build script can be checked.
     bundled_pyd = os.path.join(REPO, "backend-dist", "backend", "app", "jarvis_disk.pyd")
-    check("the bundled .pyd exists", os.path.exists(bundled_pyd), bundled_pyd)
     if os.path.exists(bundled_pyd):
         check("the bundled .pyd is a real module",
               hasattr(disk_scan._load_extension(__import__("pathlib").Path(bundled_pyd)),
                       "scan_disk"))
+    else:
+        print("SKIP  the bundled .pyd is missing (run scripts/build_backend.ps1 "
+              "and scripts/build_disk_scan.ps1 to check it)")
     cands = [str(p).lower() for p in disk_scan.candidate_paths()]
     check("load_scanner knows the packaged backend folder",
           any(os.path.join("backend", "app") in c for c in cands), cands[:8])

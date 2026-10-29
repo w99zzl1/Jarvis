@@ -1,14 +1,20 @@
 {
-  "name": "@figma/my-make-file",
+  "name": "jarvis",
+  "version": "0.1.0-beta.1",
+  "description": "Jarvis - a desktop AI assistant for Windows",
+  "license": "UNLICENSED",
   "private": true,
-  "version": "0.0.1",
   "type": "module",
   "scripts": {
     "build": "vite build",
     "dev": "vite",
     "tauri": "tauri",
-    "tauri:dev": "set \"PATH=C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64;D:\\Windows Kits\\10\\bin\\10.0.17763.0\\x64;%PATH%\" && set \"LIB=C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64;D:\\Windows Kits\\10\\Lib\\10.0.17763.0\\ucrt\\x64;D:\\Windows Kits\\10\\Lib\\10.0.17763.0\\um\\x64\" && set \"INCLUDE=C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\include;D:\\Windows Kits\\10\\Include\\10.0.17763.0\\ucrt;D:\\Windows Kits\\10\\Include\\10.0.17763.0\\um;D:\\Windows Kits\\10\\Include\\10.0.17763.0\\shared;D:\\Windows Kits\\10\\Include\\10.0.17763.0\\winrt\" && npx tauri dev",
-    "tauri:build": "set \"PATH=C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64;D:\\Windows Kits\\10\\bin\\10.0.17763.0\\x64;%PATH%\" && set \"LIB=C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64;D:\\Windows Kits\\10\\Lib\\10.0.17763.0\\ucrt\\x64;D:\\Windows Kits\\10\\Lib\\10.0.17763.0\\um\\x64\" && set \"INCLUDE=C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\include;D:\\Windows Kits\\10\\Include\\10.0.17763.0\\ucrt;D:\\Windows Kits\\10\\Include\\10.0.17763.0\\um;D:\\Windows Kits\\10\\Include\\10.0.17763.0\\shared;D:\\Windows Kits\\10\\Include\\10.0.17763.0\\winrt\" && npx tauri build"
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "icon": "python scripts/make_icon.py",
+    "backend": "powershell -ExecutionPolicy Bypass -File scripts/build_backend.ps1",
+    "disk-scan": "powershell -ExecutionPolicy Bypass -File scripts/build_disk_scan.ps1",
+    "test:paths": "python tests/test_paths.py"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",

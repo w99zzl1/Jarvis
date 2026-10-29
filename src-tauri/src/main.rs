@@ -277,7 +277,9 @@ fn resolve_backend(app: &tauri::AppHandle) -> Result<Vec<BackendCommand>, String
     }])
 }
 
-/// GET /health over a raw socket: the backend is up only when it answers.
+/// GET /health over a raw socket: the backend is up only when it answers 200
+/// *and* identifies itself. Another program squatting on port 8765 must never
+/// be mistaken for our backend, or the UI would talk to a stranger.
 fn backend_healthy() -> bool {
     let addr = match format!("127.0.0.1:{}", BACKEND_PORT).parse() {
         Ok(addr) => addr,
@@ -295,14 +297,30 @@ fn backend_healthy() -> bool {
     {
         return false;
     }
-    let mut buf = [0u8; 32];
-    match stream.read(&mut buf) {
-        Ok(n) if n > 12 => {
-            let head = String::from_utf8_lossy(&buf[..n]);
-            head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 8192 {
+                    break;
+                }
+            }
+            Err(_) => break,
         }
-        _ => false,
     }
+
+    let response = String::from_utf8_lossy(&buf);
+    let status_ok =
+        response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200");
+    if !status_ok {
+        return false;
+    }
+    // `{"status":"ok","service":"jarvis-backend",...}`
+    response.contains("\"service\":\"jarvis-backend\"")
 }
 
 fn backend_log_path(data_dir: &Path) -> PathBuf {
@@ -310,16 +328,20 @@ fn backend_log_path(data_dir: &Path) -> PathBuf {
 }
 
 /// Keep the UI informed about the backend without blocking startup.
-fn spawn_backend_watchdog(app: tauri::AppHandle, launched: bool, mut status: BackendStatus) {
+///
+/// `status` describes the state right after launching:
+/// * `failed`  - nothing was started (missing runtime, port taken); report once;
+/// * `ready`   - an already healthy backend was reused; watch it from now on;
+/// * otherwise - wait for `/health` to answer, then keep watching.
+fn spawn_backend_watchdog(app: tauri::AppHandle, mut status: BackendStatus) {
     std::thread::spawn(move || {
-        let mut announced_healthy = false;
-        let deadline = Instant::now() + Duration::from_secs(60);
-
-        if !launched {
-            status.failed = true;
+        if status.failed {
             push_backend_status(&app, status);
             return;
         }
+
+        let mut announced_healthy = status.ready;
+        let deadline = Instant::now() + Duration::from_secs(60);
 
         loop {
             let healthy = backend_healthy();
@@ -958,7 +980,6 @@ fn main() {
                     )
                 }
             };
-            let launched = child.is_some();
             app.manage(PythonServer(Mutex::new(child)));
 
             let config = load_config(app.handle());
@@ -976,7 +997,7 @@ fn main() {
             });
 
             // Started after AppState exists so the first status update lands.
-            spawn_backend_watchdog(app.handle().clone(), launched, status);
+            spawn_backend_watchdog(app.handle().clone(), status);
 
             let _js = format!(
                 "document.querySelectorAll('[data-panel-bg]').forEach(function(e){{e.style.background='rgba(1, 4, 8, {})}});",

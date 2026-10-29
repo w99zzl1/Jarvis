@@ -65,6 +65,9 @@ struct AppState {
     settings_before_console: Mutex<bool>,
     config: Mutex<AppConfig>,
     backend: Mutex<BackendStatus>,
+    /// Per-launch secret the UI must send to the local API. Never written to
+    /// disk and never logged; a new value on every start.
+    api_token: String,
 }
 
 fn config_path(app: &tauri::AppHandle) -> PathBuf {
@@ -417,34 +420,54 @@ fn listening_pids(port: u16) -> Vec<u32> {
     pids
 }
 
-fn process_image(pid: u32) -> String {
-    Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {}", pid), "/NH", "/FO", "CSV"])
+/// Image name and command line of `pid`, lowercased, one per line.
+///
+/// `tasklist` only reports the image name, and `python.exe` alone does not prove
+/// that the process on our port is *our* backend: any other Python program may
+/// hold it. Only a process that runs `server/main.py` may be killed.
+fn process_details(pid: u32) -> String {
+    if !cfg!(windows) {
+        return String::new();
+    }
+
+    let script = format!(
+        "$p = Get-CimInstance Win32_Process -Filter \"ProcessId={}\" -ErrorAction SilentlyContinue; \
+         if ($p) {{ Write-Output $p.Name; Write-Output $p.CommandLine }}",
+        pid
+    );
+    Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase())
         .unwrap_or_default()
 }
 
+/// Does this image name + command line belong to a Jarvis backend?
+fn is_jarvis_backend(details: &str) -> bool {
+    details.contains("python")
+        && (details.contains("server\\main.py") || details.contains("server/main.py"))
+}
+
 /// Kill a python backend left behind by a previous run.
 ///
 /// Ctrl+C (or closing the console) terminates the Tauri process without running
-/// its destructors, so the python child survives and keeps the port. Only
-/// python processes are ever touched - if something else owns the port we only
-/// warn about it.
+/// its destructors, so the python child survives and keeps the port. Only a
+/// process that is recognisably our backend is ever touched - if something else
+/// owns the port we only warn about it.
 fn stop_stale_backend(port: u16) {
     for pid in listening_pids(port) {
-        let image = process_image(pid);
-        if !image.contains("python") {
+        let details = process_details(pid);
+        if !is_jarvis_backend(&details) {
             eprintln!(
                 "[backend] port {} is owned by pid {} ({}) - leaving it alone",
                 port,
                 pid,
-                image.trim()
+                details.trim()
             );
             continue;
         }
 
-        eprintln!("[backend] stopping stale python backend (pid {})", pid);
+        eprintln!("[backend] stopping stale jarvis backend (pid {})", pid);
         let _ = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output();
@@ -509,10 +532,60 @@ fn center_on_primary_monitor(app: &tauri::AppHandle, w: f64, h: f64) -> Option<(
     Some((x.round() as i32, y.round() as i32))
 }
 
+/// 32 random bytes from the OS CSPRNG, hex encoded (64 chars).
+///
+/// The token is the only thing standing between the local API - which can run
+/// shell commands - and every other process on the machine, so it must not be
+/// guessable and must not be derived from time or a PID.
+#[cfg(windows)]
+fn generate_api_token() -> String {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
+
+    let mut bytes = [0u8; 32];
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        // A failure here means no OS entropy: better not to start than to fall
+        // back to something predictable and quietly drop the protection.
+        panic!("BCryptGenRandom failed with NTSTATUS {status:#x}");
+    }
+    hex(&bytes)
+}
+
+#[cfg(not(windows))]
+fn generate_api_token() -> String {
+    // Not a supported target; keep the code compiling for local checks.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    hex(&nanos.to_le_bytes())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 fn start_python_backend(
     commands: &[BackendCommand],
     data_dir: &Path,
     workdir: &Path,
+    api_token: &str,
 ) -> (Option<Child>, BackendStatus) {
     let mode = commands
         .first()
@@ -521,31 +594,13 @@ fn start_python_backend(
         .to_string();
 
     if port_is_open(BACKEND_PORT) {
-        // A previous run that was killed with Ctrl+C leaves its python child
-        // alive on the port; during development we take the port back instead
-        // of silently attaching to an orphan. A packaged build leaves a foreign
-        // process alone and reports it, so we never kill an unrelated server.
-        if cfg!(debug_assertions) {
-            stop_stale_backend(BACKEND_PORT);
-        }
+        // A previous run that was killed with Ctrl+C (or crashed) leaves its
+        // python child alive on the port. We take the port back, but only from
+        // a process we can identify as *our* backend: stop_stale_backend checks
+        // the command line before killing anything.
+        stop_stale_backend(BACKEND_PORT);
 
         if port_is_open(BACKEND_PORT) {
-            if backend_healthy() {
-                eprintln!(
-                    "[backend] 127.0.0.1:{} already serves a healthy backend, reusing it",
-                    BACKEND_PORT
-                );
-                return (
-                    None,
-                    BackendStatus {
-                        ready: true,
-                        failed: false,
-                        message: String::new(),
-                        mode,
-                    },
-                );
-            }
-
             let message = format!(
                 "Port {} is already used by another program, so the local backend cannot start. \
                  Close that program and reopen Jarvis.",
@@ -587,6 +642,7 @@ fn start_python_backend(
             .current_dir(&spec.cwd)
             .env("JARVIS_DATA_DIR", data_dir)
             .env("JARVIS_WORKDIR", workdir)
+            .env("JARVIS_API_TOKEN", api_token)
             .env("PYTHONUTF8", "1")
             .env("PYTHONIOENCODING", "utf-8")
             .stdin(Stdio::null());
@@ -955,8 +1011,27 @@ fn backend_status(state: State<AppState>) -> BackendStatus {
         })
 }
 
+/// The per-launch token the UI must send as `X-Jarvis-Token`.
+///
+/// Calls come only from the app's own WebView; the command is not exposed to
+/// the network. It stays in memory for the lifetime of the process.
+#[tauri::command]
+fn api_token(state: State<'_, AppState>) -> String {
+    state.api_token.clone()
+}
+
 fn main() {
     tauri::Builder::default()
+        // Must be registered before other plugins: the second instance should
+        // do nothing but hand focus to the first one - no second backend, no
+        // second token fighting over port 8765.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .setup(|app| {
             let data = data_dir();
             let _ = std::fs::create_dir_all(&data);
@@ -964,9 +1039,12 @@ fn main() {
                 .workdir
                 .map(PathBuf::from)
                 .unwrap_or_else(default_workdir);
+            let api_token = generate_api_token();
 
             let (child, status) = match resolve_backend(app.handle()) {
-                Ok(commands) => start_python_backend(&commands, &data, &workdir),
+                Ok(commands) => {
+                    start_python_backend(&commands, &data, &workdir, &api_token)
+                }
                 Err(message) => {
                     eprintln!("[backend] {}", message);
                     (
@@ -994,6 +1072,7 @@ fn main() {
                 settings_before_console: Mutex::new(false),
                 config: Mutex::new(config),
                 backend: Mutex::new(status.clone()),
+                api_token,
             });
 
             // Started after AppState exists so the first status update lands.
@@ -1052,6 +1131,7 @@ fn main() {
             get_workdir,
             set_workdir,
             backend_status,
+            api_token,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1130,5 +1210,27 @@ mod tests {
         let cfg: AppConfig = serde_json::from_str(legacy).unwrap();
         assert_eq!(cfg.api_keys.get("google").map(String::as_str), Some("g"));
         assert!(cfg.selected_primary.is_none());
+    }
+
+    #[test]
+    fn api_tokens_are_64_hex_chars_and_unique() {
+        let a = generate_api_token();
+        let b = generate_api_token();
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn only_a_jarvis_server_main_py_counts_as_a_stale_backend() {
+        let bundled = "python.exe\n\"c:\\users\\me\\appdata\\local\\jarvis\\backend\\python\\python.exe\" \
+                       \"c:\\users\\me\\appdata\\local\\jarvis\\backend\\app\\server\\main.py\"";
+        assert!(is_jarvis_backend(bundled));
+        assert!(is_jarvis_backend("python\nc:/repo/jarvis/server/main.py"));
+
+        // A python that is not our backend, or our path in something else.
+        assert!(!is_jarvis_backend("python.exe\nc:\\tools\\http_server.py"));
+        assert!(!is_jarvis_backend("node.exe\nsomething server\\main.py"));
+        assert!(!is_jarvis_backend(""));
     }
 }

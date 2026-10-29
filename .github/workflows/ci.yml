@@ -50,6 +50,9 @@ jobs:
       - name: Path contract
         run: python tests/test_paths.py
 
+      - name: Security contract (token and CORS)
+        run: python tests/test_security.py
+
       - name: Import the backend
         run: python -c "import server.main; print('server import OK')"
 

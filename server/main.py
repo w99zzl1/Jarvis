@@ -14,7 +14,6 @@ if _server_dir not in sys.path:
     sys.path.insert(0, _server_dir)
 
 from fastapi import FastAPI, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from routes.chat import chat_route, chat_stream
@@ -24,6 +23,7 @@ from shared.llm_client.model_fetcher import check_connected_providers_and_fetch_
 from shared.config_loader import get_selected_models
 from shared import agent_job
 from shared import paths as _paths
+from security import install as install_security
 
 log = logging.getLogger("server")
 
@@ -136,13 +136,9 @@ async def upload_files(files: List[UploadFile] = File(...)):
     return {"success": True, "attachments": saved}
 
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Per-launch token + CORS. See server/security.py: the API can run shell
+# commands, so listening on localhost is not enough on its own.
+install_security(app)
 
 
 class ModelSpec(BaseModel):

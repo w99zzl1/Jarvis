@@ -14,7 +14,8 @@
     "icon": "python scripts/make_icon.py",
     "backend": "powershell -ExecutionPolicy Bypass -File scripts/build_backend.ps1",
     "disk-scan": "powershell -ExecutionPolicy Bypass -File scripts/build_disk_scan.ps1",
-    "test:paths": "python tests/test_paths.py"
+    "test:paths": "python tests/test_paths.py",
+    "test:security": "python tests/test_security.py"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",

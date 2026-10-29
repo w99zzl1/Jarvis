@@ -90,6 +90,22 @@ Both locations can be overridden with the `JARVIS_DATA_DIR` and
 
 ---
 
+## Security
+
+Jarvis is a local app, with the usual local-app trade-offs:
+
+* The backend listens on `127.0.0.1:8765` only, never on the network.
+* Every launch generates a random token in the Rust shell and passes it to the
+  backend; the UI sends it with each request. Another program would have to
+  know that token to call the API, and a website cannot call it at all (CORS is
+  restricted to the app origin).
+* API keys are stored in plain text in `api_keys.json` inside your user profile.
+  There is no OS keychain integration yet.
+* The agent can read and write files, run shell commands and call the network.
+  Treat a prompt that asks you to paste a secret as suspicious.
+
+---
+
 ## Build from source
 
 Prerequisites:

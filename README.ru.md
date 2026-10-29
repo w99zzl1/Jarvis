@@ -121,7 +121,7 @@ Jarvis — локальное приложение, и компромиссы з
 * Git
 
 ```powershell
-git clone <этот репозиторий> Jarvis
+git clone https://github.com/w99zzl1/Jarvis.git Jarvis
 cd Jarvis
 npm install
 npm run tauri:dev

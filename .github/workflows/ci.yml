@@ -77,6 +77,15 @@ jobs:
               New-Item -ItemType Directory -Path "backend-dist\backend" -Force | Out-Null
           }
 
+      # tauri::generate_context! embeds the built frontend, which this job does
+      # not produce. The directory only has to exist for the macro to run.
+      - name: Ensure the frontend directory exists
+        run: |
+          if (-not (Test-Path "dist")) {
+              New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+              Set-Content -Path "dist\index.html" -Value "<!doctype html><title>Jarvis</title>"
+          }
+
       - name: cargo check
         working-directory: src-tauri
         run: cargo check --locked

@@ -1,0 +1,48 @@
+# --- Dependencies / build output ---
+node_modules/
+dist/
+.vite/
+src-tauri/target/
+src-tauri/gen/schemas/
+native/**/target/
+backend-dist/
+
+# --- Python ---
+# Local build of native/jarvis-disk (contains absolute build paths).
+# CI produces a clean .pyd and ships it inside the installer.
+/jarvis_disk.pyd
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# --- Application data (must never be committed) ---
+conversations/
+traces/
+server/traces/
+uploads/
+_file_index/
+.tmp/
+memory_store.json
+tasks_history.json
+shared/location_cache.json
+
+# --- Secrets ---
+.env
+.env.*
+api_keys.json
+
+# --- Logs ---
+*.log
+
+# --- Local toolchain overrides (machine-specific MSVC paths) ---
+src-tauri/.cargo/config.toml
+
+# --- OS / editors ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

@@ -1,0 +1,591 @@
+import { invoke } from "@tauri-apps/api/core";
+import type { ProviderId } from "./models";
+
+const API_BASE = "http://127.0.0.1:8765";
+
+// ============================================================================
+// Типы: AppConfig (хранится в Tauri: провайдеры → ключи, выбранная primary)
+// ============================================================================
+
+/** Конфиг, совместимый с Rust AppConfig: api_keys — HashMap<String, String>, selected_model тоже обязательно */
+export interface AppConfig {
+  api_keys: Record<string, string>;
+  selected_primary: { provider: ProviderId; model: string } | null;
+  selected_model: Record<string, string>;
+  /** Code-agent tools the user switched off in the side dock. */
+  disabled_tools: string[];
+}
+
+export async function getConfig(): Promise<AppConfig> {
+  const raw = await invoke<any>("get_config");
+  return normalizeConfig(raw);
+}
+
+export async function setConfig(config: AppConfig): Promise<void> {
+  await invoke("set_config", { newConfig: config });
+}
+
+/**
+ * Нормализует конфиг из любого старого формата.
+ * - Старый selected_model Record<string, string> → selected_primary {provider,model}
+ * - Старые ключи строкой → Record<string, string>
+ */
+export function normalizeConfig(raw: any): AppConfig {
+  if (!raw) raw = {};
+  const api_keys: Record<string, string> = {};
+  const srcKeys = raw.api_keys ?? {};
+  for (const [k, v] of Object.entries<any>(srcKeys)) {
+    if (typeof v === "string") api_keys[k] = v;
+    else if (v && typeof v === "object" && typeof v.key === "string") api_keys[k] = v.key;
+  }
+
+  let selected_primary: AppConfig["selected_primary"] = null;
+
+  if (raw.selected_primary && typeof raw.selected_primary === "object") {
+    selected_primary = {
+      provider: raw.selected_primary.provider as ProviderId,
+      model: String(raw.selected_primary.model ?? ""),
+    };
+  }
+
+  // Legacy fallback — selected_model: { provider, code }
+  if (!selected_primary && raw.selected_model && typeof raw.selected_model === "object") {
+    const sm = raw.selected_model as Record<string, string>;
+    if (sm.provider && sm.code) {
+      selected_primary = { provider: sm.provider as ProviderId, model: sm.code };
+    }
+  }
+
+  const disabled_tools = Array.isArray(raw.disabled_tools)
+    ? raw.disabled_tools.filter((n: any) => typeof n === "string")
+    : [];
+
+  return {
+    api_keys,
+    selected_primary,
+    selected_model: raw.selected_model || {},
+    disabled_tools,
+  };
+}
+
+// ============================================================================
+// Типы: ChatRequest Body (новый контракт с primary_spec)
+// ============================================================================
+
+export interface ModelSpec {
+  provider: ProviderId;
+  model: string;
+}
+
+export interface ChatRequestPayload {
+  message: string;
+  /** Stable id so the backend can keep this conversation's history across turns. */
+  conversation_id?: string;
+  primary_spec?: ModelSpec;
+  /** Legacy-поля — для обратной совместимости, слой сервера их всё равно читает */
+  primary_model?: string;
+  primary_provider?: ProviderId;
+  /** Ключи: { groq: {key: "..."}, google: {key: "..."}, ... } или { groq: "...", ... } */
+  api_keys?: Record<string, string>;
+  api_key?: string;
+  system_prompt?: string;
+  vision_model?: string;
+  config?: any;
+  /** Code-agent tools to hide from the model for this request. */
+  disabled_tools?: string[];
+  /** Attached files (images, documents, archives) — absolute paths on the server. */
+  attachments?: FileAttachment[];
+}
+
+/** File uploaded by the user and persisted by the backend. */
+export interface FileAttachment {
+  /** Absolute path on the server where the file was saved. */
+  path: string;
+  /** Original file name. */
+  name: string;
+  /** MIME type, e.g. "image/png", "text/plain". */
+  mime?: string;
+  /** File size in bytes. */
+  size?: number;
+  /** For images: local preview URL (blob: URL) for frontend display only. */
+  previewUrl?: string;
+  /** For images: base64 data URL (optional, for inline display). */
+  dataUrl?: string;
+}
+
+export interface ToolCallInfo {
+  name: string;
+  arguments: string;
+}
+
+export interface ChatResponse {
+  reply: string | null;
+  tool_calls: ToolCallInfo[] | null;
+  audio: string | null;
+  /** Images returned by the model (Vision responses), as base64 data URLs. */
+  images?: string[];
+}
+
+export interface HealthResponse {
+  status: string;
+}
+
+// ============================================================================
+// SSE Stream Events
+// ============================================================================
+
+export interface StreamProgressEvent {
+  type: "progress";
+  phase: string;
+  label?: string;
+  detail?: string;
+  tool?: string;
+  duration?: number;
+  status?: string;
+  reason?: string;
+}
+export interface StreamThoughtEvent {
+  type: "thought";
+  preview: string;
+}
+export interface StreamFinalEvent {
+  type: "final";
+  reply: string | null;
+  audio: string | null;
+  success: boolean;
+  state: string;
+  iterations: number;
+  tool_calls: number;
+  trace_id: string | null;
+  model_used: string;
+  attempts: number;
+  verification_status: string | null;
+  verification_reason: string | null;
+  error: string | null;
+  /** Echoed/assigned by the backend; persist it for the next turn. */
+  conversation_id?: string | null;
+}
+export interface StreamPlanEvent {
+  type: "plan";
+  steps: { id: string; text: string; status: string }[];
+}
+export interface StreamReportEvent {
+  type: "report";
+  text: string;
+}
+export interface StreamPlanUpdatedEvent {
+  type: "plan_updated";
+  steps: { id: string; text: string; status: string }[] | null;
+}
+export interface StreamToolEvent {
+  type: "tool_started" | "tool_completed";
+  tool?: string;
+  args?: any;
+  status?: string;
+  duration?: number;
+  call_id?: string;
+}
+export interface StreamToolProgressEvent {
+  type: "tool_progress";
+  tool?: string;
+  call_id?: string;
+  /** Estimated completion, 0..100. `done` events carry exactly 100. */
+  percent: number;
+  nodes: number;
+  bytes: number;
+  queued: number;
+  elapsed: number;
+  done: boolean;
+}
+export interface StreamAgentMessageEvent {
+  type: "agent_message";
+  message: string;
+}
+export interface StreamStreamEvent {
+  type: "stream";
+  text: string;
+  iteration?: number;
+}
+export interface StreamExecutionInfoEvent {
+  type: "execution_error" | "execution_completed" | "task_started" | "task_completed" | "task_failed";
+  message?: string;
+  error?: string;
+}
+export type StreamEvent =
+  | StreamProgressEvent
+  | StreamThoughtEvent
+  | StreamPlanEvent
+  | StreamReportEvent
+  | StreamPlanUpdatedEvent
+  | StreamToolEvent
+  | StreamToolProgressEvent
+  | StreamAgentMessageEvent
+  | StreamStreamEvent
+  | StreamExecutionInfoEvent
+  | StreamFinalEvent;
+
+// ============================================================================
+// Отправка запросов (Voice Jarvis + Code Agent, streaming и обычные)
+// ============================================================================
+
+function buildBody(
+  message: string,
+  primary: ModelSpec | undefined | null,
+  apiKeys: Record<string, string> | undefined,
+  extra: Partial<ChatRequestPayload> = {},
+): string {
+  const payload: ChatRequestPayload = { message, ...extra };
+  if (primary) payload.primary_spec = primary;
+  if (apiKeys) payload.api_keys = apiKeys;
+  return JSON.stringify(payload);
+}
+
+// --- Non-streaming ---------------------------------------------------------
+
+/** Voice Jarvis POST /chat */
+export async function sendVoiceChat(
+  message: string,
+  primary?: ModelSpec | null,
+  apiKeys?: Record<string, string>,
+): Promise<ChatResponse> {
+  return apiFetch<ChatResponse>("/chat", {
+    method: "POST",
+    body: buildBody(message, primary, apiKeys),
+  });
+}
+
+/** Code Agent POST /code/chat */
+export async function sendCodeChat(
+  message: string,
+  primary?: ModelSpec | null,
+  apiKeys?: Record<string, string>,
+): Promise<ChatResponse> {
+  return apiFetch<ChatResponse>("/code/chat", {
+    method: "POST",
+    body: buildBody(message, primary, apiKeys),
+  });
+}
+
+// --- Streaming -------------------------------------------------------------
+
+export async function sendChatStreaming(
+  endpoint: "/chat/stream" | "/code/chat/stream" | "/agent/chat/stream",
+  message: string,
+  primary: ModelSpec | undefined | null,
+  apiKeys: Record<string, string> | undefined,
+  onEvent: (event: StreamEvent) => void,
+  extra: Partial<ChatRequestPayload> = {},
+  signal?: AbortSignal,
+): Promise<StreamFinalEvent> {
+  const res = await fetch(`${API_BASE}${endpoint}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: buildBody(message, primary, apiKeys, extra),
+    signal,
+  });
+
+  if (!res.ok || !res.body) {
+    throw new Error(`API ${res.status}: ${res.statusText}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let finalEvent: StreamFinalEvent | null = null;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let sepIdx: number;
+    while ((sepIdx = buffer.indexOf("\n\n")) >= 0) {
+      const frame = buffer.slice(0, sepIdx);
+      buffer = buffer.slice(sepIdx + 2);
+      const lines = frame.split("\n");
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const payloadText = trimmed.slice(5).trim();
+        if (!payloadText) continue;
+        try {
+          const ev = JSON.parse(payloadText) as StreamEvent;
+          if (ev.type === "final") {
+            finalEvent = ev;
+          } else {
+            onEvent(ev);
+          }
+        } catch {
+          // ignore malformed frames
+        }
+      }
+    }
+  }
+
+  if (!finalEvent) {
+    throw new Error("Stream did not produce a final event");
+  }
+  return finalEvent;
+}
+
+/** Streaming Code Agent — /code/chat/stream */
+export async function sendCodeChatStreaming(
+  message: string,
+  primary: ModelSpec | undefined | null,
+  apiKeys: Record<string, string> | undefined,
+  onEvent: (event: StreamEvent) => void,
+  extra: Partial<ChatRequestPayload> = {},
+  signal?: AbortSignal,
+): Promise<StreamFinalEvent> {
+  return sendChatStreaming(
+    "/code/chat/stream",
+    message,
+    primary,
+    apiKeys,
+    onEvent,
+    extra,
+    signal,
+  );
+}
+
+/** Streaming Main Jarvis — /chat/stream */
+export async function sendMainChatStreaming(
+  message: string,
+  primary: ModelSpec | undefined | null,
+  apiKeys: Record<string, string> | undefined,
+  onEvent: (event: StreamEvent) => void,
+  extra: Partial<ChatRequestPayload> = {},
+  signal?: AbortSignal,
+): Promise<StreamFinalEvent> {
+  return sendChatStreaming(
+    "/chat/stream",
+    message,
+    primary,
+    apiKeys,
+    onEvent,
+    extra,
+    signal,
+  );
+}
+
+// ============================================================================
+// Misc helpers
+// ============================================================================
+
+export async function healthCheck(): Promise<HealthResponse> {
+  return apiFetch<HealthResponse>("/health");
+}
+
+export async function startListening(): Promise<void> {
+  await apiFetch("/stt/start", { method: "POST" }).catch(() => {});
+}
+
+export async function stopListening(): Promise<{ text: string }> {
+  return apiFetch<{ text: string }>("/stt/stop", { method: "POST" }).catch(() => ({ text: "" }));
+}
+
+export function playAudioFromBase64(base64: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const audio = new Audio(`data:audio/mp3;base64,${base64}`);
+    audio.onended = () => resolve();
+    audio.onerror = (e) => reject(e);
+    audio.play().catch(reject);
+  });
+}
+
+async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { "Content-Type": "application/json" },
+    ...init,
+  });
+  if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
+  return res.json();
+}
+
+// ============================================================================
+// File uploads (drag-drop / paste attachments)
+// ============================================================================
+
+/** Upload one or more files to the server. Returns server-side file info. */
+export async function uploadFiles(
+  files: FileList | File[],
+): Promise<FileAttachment[]> {
+  const fileArray = Array.from(files);
+  const form = new FormData();
+  for (const f of fileArray) {
+    form.append("files", f);
+  }
+  const res = await fetch(`${API_BASE}/upload`, {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`Upload failed (${res.status}): ${text}`);
+  }
+  const data = await res.json();
+  return (data.attachments || []) as FileAttachment[];
+}
+
+// ============================================================================
+// Tasks API
+// ============================================================================
+
+export interface TaskInfo {
+  id: string;
+  type: string;
+  status: string;
+  description: string;
+  progress: number;
+  eta: string;
+  speed: string;
+  result: string;
+  error: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface TaskEvent {
+  event: string;
+  task_id: string;
+  progress?: number;
+  eta?: string;
+  speed?: string;
+  result?: string;
+  error?: string;
+}
+
+export async function fetchLiveModels(apiKeys?: Record<string, string>): Promise<Record<string, string[]>> {
+  try {
+    const res = await fetch(`${API_BASE}/models/fetch`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ api_keys: apiKeys }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.models || {};
+    }
+  } catch (e) {
+    console.error("Failed to fetch live models", e);
+  }
+  return {};
+}
+
+export interface CodeToolInfo {
+  name: string;
+  description: string;
+  /** "always" = sent to the model upfront, "on_demand" = loaded via get_tools. */
+  group: string;
+}
+
+/** GET /code/tools — full code-agent tool catalog for the side-dock toggles. */
+export async function fetchCodeTools(): Promise<CodeToolInfo[]> {
+  try {
+    const res = await fetch(`${API_BASE}/code/tools`);
+    if (res.ok) {
+      const data = await res.json();
+      return (data.tools || []) as CodeToolInfo[];
+    }
+  } catch (e) {
+    console.error("Failed to fetch code tools", e);
+  }
+  return [];
+}
+
+// ============================================================================
+// Conversations (chat history)
+// ============================================================================
+
+export interface ConversationSummary {
+  id: string;
+  title: string;
+  turns: number;
+  updated: number;
+}
+
+/** One persisted event from the backend event log. */
+export interface ConversationEvent {
+  role?: string;
+  content?: unknown;
+  [k: string]: unknown;
+}
+
+/** GET /conversations — newest-first chat-history summaries. */
+export async function fetchConversations(): Promise<ConversationSummary[]> {
+  try {
+    const res = await fetch(`${API_BASE}/conversations`);
+    if (res.ok) {
+      const data = await res.json();
+      return (data.conversations || []) as ConversationSummary[];
+    }
+  } catch (e) {
+    console.error("Failed to fetch conversations", e);
+  }
+  return [];
+}
+
+/** GET /conversations/{id} — raw event log so the UI can replay it. */
+export async function fetchConversation(id: string): Promise<ConversationEvent[]> {
+  try {
+    const res = await fetch(`${API_BASE}/conversations/${encodeURIComponent(id)}`);
+    if (res.ok) {
+      const data = await res.json();
+      return (data.events || []) as ConversationEvent[];
+    }
+  } catch (e) {
+    console.error("Failed to fetch conversation", e);
+  }
+  return [];
+}
+
+export async function deleteConversation(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/conversations/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+    return res.ok;
+  } catch (e) {
+    console.error("Failed to delete conversation", e);
+  }
+  return false;
+}
+
+export async function getTasks(): Promise<{ tasks: TaskInfo[]; active_count: number }> {
+  return apiFetch("/tasks");
+}
+
+export async function getTask(taskId: string): Promise<TaskInfo> {
+  return apiFetch(`/tasks/${taskId}`);
+}
+
+export async function cancelTask(taskId: string): Promise<void> {
+  await apiFetch(`/tasks/${taskId}`, { method: "DELETE" });
+}
+
+export async function stopAgent(conversationId: string) {
+  const res = await fetch(`${API_BASE}/agent/stop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ conversation_id: conversationId }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export function subscribeTaskEvents(
+  onEvent: (event: TaskEvent) => void,
+): { stop: () => void } {
+  const es = new EventSource(`${API_BASE}/tasks/events`);
+  es.onmessage = (e) => {
+    try {
+      const ev = JSON.parse(e.data);
+      if (ev.type !== "ping") {
+        onEvent(ev);
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+  return { stop: () => es.close() };
+}

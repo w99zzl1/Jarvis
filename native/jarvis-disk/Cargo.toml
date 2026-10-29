@@ -1,0 +1,18 @@
+[package]
+name = "jarvis-disk"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "jarvis_disk"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+pyo3 = { version = "0.29.3", features = ["abi3-py310", "extension-module"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

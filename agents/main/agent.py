@@ -706,6 +706,18 @@ class Agent:
                     ]
 
                 if tool_calls and self._detect_loop(tool_call_history, tc_list):
+                    # Persist the assistant turn together with synthetic tool
+                    # results so the conversation stays OpenAI-valid (an
+                    # assistant message carrying tool_calls must be followed
+                    # by matching tool messages). Otherwise the next attempt
+                    # or provider rejects the replayed history.
+                    self.log.add_assistant(content, tc_list)
+                    for tc in tool_calls:
+                        self.log.add_tool_result(
+                            tc.id, tc.function.name,
+                            "[not executed: loop pattern detected]",
+                            result_status="error", duration=0.0,
+                        )
                     out.update({
                         "state": AgentState.LOOP_EXCEEDED.value,
                         "iterations": iteration,
@@ -714,7 +726,6 @@ class Agent:
                         "tool_log": tool_log,
                         "duration": time.time() - start,
                     })
-                    self.log.add_assistant(content, tc_list)
                     return out
 
                 self.log.add_assistant(content, tc_list)

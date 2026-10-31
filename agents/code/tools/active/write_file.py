@@ -1,6 +1,6 @@
 import os
 from typing import Dict, Any
-from ..base import Tool, resolve_path
+from ..base import Tool, resolve_path, python_syntax_error
 
 
 class WriteFileTool(Tool):
@@ -29,11 +29,19 @@ class WriteFileTool(Tool):
             with open(full_path, mode, encoding='utf-8') as f:
                 f.write(content)
 
-            return {
+            result = {
                 "success": True,
                 "path": full_path,
                 "bytes_written": len(content.encode('utf-8')),
-                "operation": "append" if append else "write"
+                "operation": "append" if append else "write",
             }
+            syntax_error = python_syntax_error(full_path)
+            if syntax_error:
+                result["syntax_ok"] = False
+                result["warning"] = (
+                    f"File was written but does not parse as Python: {syntax_error}. "
+                    "Fix it before continuing."
+                )
+            return result
         except Exception as e:
             return {"success": False, "error": str(e)}

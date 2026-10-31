@@ -209,6 +209,56 @@ def _detect_pseudo_tool_attempt(text: str | None) -> bool:
         return True
     return False
 
+# Tool names that change state on disk. Used to decide whether a turn that
+# opened a plan but never closed it actually did the work.
+_MUTATING_TOOL_HINTS = (
+    "write", "edit", "create", "delete", "remove", "move", "rename",
+    "copy", "append", "patch", "shell", "run", "exec",
+)
+
+
+def _is_mutating_tool(name: str) -> bool:
+    lowered = (name or "").lower()
+    return any(hint in lowered for hint in _MUTATING_TOOL_HINTS)
+
+
+def _plan_progress(tool_calls_log: list[dict]) -> tuple[int, int, bool] | None:
+    """Summarize the last `update_plan` call: (completed, total, work_after).
+
+    `update_plan` is a legitimate tool whose result is always "success", so a
+    turn that only planned - text reply, plan stored, zero files written - used
+    to pass verification as `all_tools_verified_success(1/1)`. The user then saw
+    "done" for work that never happened.
+
+    `work_after` means a state-changing tool ran successfully *after* that last
+    plan update, which is the signal that the plan's open steps are just stale
+    bookkeeping rather than unfinished work.
+    """
+    last_index = -1
+    steps: list | None = None
+    for index, entry in enumerate(tool_calls_log):
+        name = entry.get("tool") or entry.get("name") or ""
+        if name != "update_plan":
+            continue
+        data = getattr(entry.get("result"), "data", None)
+        if isinstance(data, dict) and isinstance(data.get("steps"), list):
+            last_index = index
+            steps = data["steps"]
+    if steps is None:
+        return None
+
+    completed = sum(
+        1 for step in steps
+        if isinstance(step, dict) and step.get("status") == "completed"
+    )
+    work_after = any(
+        _is_mutating_tool(entry.get("tool") or entry.get("name") or "")
+        and getattr(entry.get("result"), "status", "") == "success"
+        for entry in tool_calls_log[last_index + 1:]
+    )
+    return completed, len(steps), work_after
+
+
 
 # ---------------------------------------------------------------------------
 # Decision
@@ -338,6 +388,21 @@ class Verifier:
             # Tools may all be green while the final text is a leaked tool call
             # ("default_api:read_file{...}"). The user got no answer, so retry
             # and let the model produce prose instead.
+            # A plan that never closed, with no state-changing tool run after
+            # the last update, means the model planned and then narrated. That
+            # is exactly the turn that reported success with zero files on disk.
+            plan = _plan_progress(tool_calls_log)
+            if plan is not None:
+                done, total, work_after = plan
+                if done < total and not work_after:
+                    return AttemptDecision(
+                        attempt_status=AttemptStatus.RETRY,
+                        tool_verifications=tool_verifications,
+                        aggregate=VerificationStatus.FAILED,
+                        reason=f"plan_incomplete({done}/{total})_and_no_state_change",
+                        fatal_agent_state=fatal_state,
+                    )
+
             if pseudo:
                 return AttemptDecision(
                     attempt_status=AttemptStatus.RETRY,

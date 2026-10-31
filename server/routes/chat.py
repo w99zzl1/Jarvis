@@ -70,16 +70,21 @@ def _map_to_sse_event(internal_event: dict) -> dict | None:
     if etype == "tool_started":
         return {
             "type": "tool_started",
-            "tool": internal_event.get("tool_name"),
-            "args": internal_event.get("tool_args"),
+            "tool": internal_event.get("tool") or internal_event.get("tool_name"),
+            "args": internal_event.get("args") or internal_event.get("tool_args"),
             "task_id": internal_event.get("task_id"),
             "call_id": internal_event.get("call_id"),
         }
-    if etype == "tool_completed":
+    if etype == "tool_finished":
+        # The agent emits `tool_finished`; the UI keys off `tool_completed`.
+        # Without this translation the activity row stayed "running"
+        # forever, because nothing ever closed it.
         return {
             "type": "tool_completed",
-            "tool": internal_event.get("tool_name"),
-            "result": internal_event.get("tool_result"),
+            "tool": internal_event.get("tool") or internal_event.get("tool_name"),
+            "status": internal_event.get("status"),
+            "duration": internal_event.get("duration"),
+            "result": internal_event.get("result") or internal_event.get("tool_result"),
             "task_id": internal_event.get("task_id"),
             "call_id": internal_event.get("call_id"),
         }
@@ -113,21 +118,6 @@ def _map_to_sse_event(internal_event: dict) -> dict | None:
         if preview:
             return {"type": "thought", "preview": preview}
         return None
-    if etype == "tool_started":
-        return {
-            "type": "progress",
-            "phase": "executing",
-            "tool": internal_event.get("tool"),
-            "detail": internal_event.get("args", {}),
-        }
-    if etype == "tool_finished":
-        return {
-            "type": "progress",
-            "phase": "executed",
-            "tool": internal_event.get("tool"),
-            "duration": internal_event.get("duration"),
-            "status": internal_event.get("status"),
-        }
     if etype == "attempt_started":
         return {
             "type": "progress",

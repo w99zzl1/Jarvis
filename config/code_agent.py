@@ -63,7 +63,9 @@ SYSTEM_PROMPT = (
     "-Read files before editing. Prefer edit_file for precise changes.\n"
     "-Narration: before using tools, write ONE short sentence in user's language (Russian or English) describing your current action.\n"
     "-Planning: skip update_plan for simple tasks. For multi-file or complex tasks, call update_plan FIRST and mark steps completed as you progress.\n"
-    "-Format: respond in plain concise text. Use markdown code blocks ONLY for code snippets or terminal outputs.\n\n"
+    "-Format: respond in plain concise text. Use markdown code blocks ONLY for code snippets or terminal outputs.\n"
+    "-Import style: scripts meant to run as `python file.py` must use plain imports (`from storage import ...`), never relative imports (`from .storage import ...`).\n"
+    "-Verify: after writing or changing a script, run a quick command (`python file.py ...`) and only report success if it actually ran.\n\n"
 
     "Guidance:\n"
     "-Prefer the narrowest purpose-built tool over a general shell command.\n"

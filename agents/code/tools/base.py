@@ -47,6 +47,28 @@ def resolve_note(path: str) -> str:
 _EXACT = "exact_path"
 
 
+def python_syntax_error(path: str) -> str | None:
+    """Return a syntax error message for a Python file, or None if it parses.
+
+    The code agent used to report a successful edit even when the result no
+    longer parsed: an edit could swallow a `def` line, or escaped quotes could
+    land in the file verbatim. Checking here turns a silently broken project
+    into feedback the model can act on immediately.
+    """
+    if not path.lower().endswith((".py", ".pyw")):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            source = f.read()
+    except OSError:
+        return None
+    try:
+        compile(source, path, "exec")
+    except SyntaxError as exc:
+        return f"{exc.msg} (line {exc.lineno}, offset {exc.offset})"
+    return None
+
+
 NARRATE_PROPERTY = {
     "type": "string",
     "description": (

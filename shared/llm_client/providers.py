@@ -104,10 +104,126 @@ _TOOL_CALL_RE = re.compile(
 )
 
 
+def _calls_from_json_object(obj: Any) -> list[dict]:
+    """Extract OpenAI-style tool calls from a decoded `failed_generation`.
+
+    Groq rejects the request when *its own* parser cannot read the arguments,
+    yet the rejected text is frequently a perfectly readable JSON envelope:
+    `{"name": "write_file", "arguments": {...}}` (or the same inside a
+    `tool_calls` list). Losing that turn over a parser disagreement is a waste,
+    so decode it here and execute the call the model meant to make.
+    """
+    if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list):
+        entries = obj["tool_calls"]
+    elif isinstance(obj, list):
+        entries = obj
+    elif isinstance(obj, dict):
+        entries = [obj]
+    else:
+        return []
+
+    calls: list[dict] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        fn = entry.get("function") if isinstance(entry.get("function"), dict) else entry
+        name = fn.get("name")
+        args = fn.get("arguments", fn.get("args"))
+        if not name:
+            continue
+        if isinstance(args, str):
+            try:
+                # strict=False tolerates raw newlines/control chars that made
+                # the provider's stricter parser bail out.
+                args = json.loads(args, strict=False)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(args, dict):
+            continue
+        calls.append({
+            "id": entry.get("id") or f"recovered_json_{index}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(args, ensure_ascii=False),
+            },
+        })
+    return calls
+
+
+# `Request too large ... (TPM): Limit 8000, Requested 8073`
+_TPM_LIMIT_RE = re.compile(
+    r"limit[:\s]+(\d+).{1,40}?requested[:\s]+(\d+)", re.IGNORECASE
+)
+# 429 variant: `Limit 8000, Used 3031, Requested 5899`
+_TPM_USED_RE = re.compile(r"used[:\s]+(\d+)", re.IGNORECASE)
+# `Please try again in 4.5075s`
+_TRY_AGAIN_RE = re.compile(r"try again in ([\d.]+)\s*s", re.IGNORECASE)
+
+# Minimum completion budget worth retrying with. Below this the model cannot
+# emit a tool call at all, so a TPM rejection means "wait", not "shrink".
+_TPM_MIN_OUTPUT = 512
+
+
+def _tpm_advice(message: str, max_tokens: int) -> tuple[float, int] | None:
+    """Plan a retry for a provider TPM rejection.
+
+    Groq enforces `used-in-this-minute + prompt + max_tokens <= limit`. Two
+    different situations hide behind that number:
+
+    * the request alone is too big (`Requested 8073` vs `Limit 8000`) — the
+      completion budget has to shrink;
+    * earlier calls in the same minute already burned the window (`Used 3031`)
+      — shrinking cannot help, the window has to drain first.
+
+    Returns `(seconds_to_wait, new_max_tokens)`, or `None` when even the
+    smallest sensible output cannot fit (the context itself is too large).
+    """
+    match = _TPM_LIMIT_RE.search(message or "")
+    if not match:
+        return None
+    limit, requested = int(match.group(1)), int(match.group(2))
+
+    used_match = _TPM_USED_RE.search(message or "")
+    used = int(used_match.group(1)) if used_match else 0
+
+    retry_match = _TRY_AGAIN_RE.search(message or "")
+    wait = float(retry_match.group(1)) + 1.0 if retry_match else 0.0
+
+    # `Requested` is the prompt plus the completion budget we asked for.
+    prompt = max(0, requested - max_tokens)
+    headroom = limit - prompt - used - 200
+
+    if headroom < _TPM_MIN_OUTPUT and used > 0:
+        # The minute window is occupied: wait it out, then retry.
+        wait = max(wait, 30.0)
+        headroom = limit - prompt - 200
+
+    if headroom < _TPM_MIN_OUTPUT:
+        return None
+
+    # Even the "shrink the budget" case is worth a short pause: a rejection
+    # means the minute window is already loaded, and immediate retries just
+    # burn more of it.
+    return max(wait, 20.0), min(max_tokens, headroom)
+
+
 def _parse_failed_generation(text: str) -> list[dict] | None:
     if not text:
         return None
     calls: list[dict] = []
+
+    # 1. Plain JSON envelope (Groq tool_use_failed).
+    stripped = text.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            decoded = json.loads(stripped, strict=False)
+        except json.JSONDecodeError:
+            decoded = None
+        if decoded is not None:
+            calls.extend(_calls_from_json_object(decoded))
+            if calls:
+                return calls
 
     for i, (name, args_str) in enumerate(_PSEUDO_FUNC_RE.findall(text)):
         try:
@@ -255,11 +371,55 @@ class BaseProvider(ABC):
                     recovered = self._try_recover_pseudo_xml(e)
                     if recovered:
                         return recovered
+                    # Unrecoverable arguments are usually a one-off generation
+                    # glitch, not a bad key or model: ask again instead of
+                    # failing the whole turn.
+                    if attempt < 2:
+                        logger.warning(
+                            "[LLM] tool_use_failed, retrying request (%d/3)", attempt + 2
+                        )
+                        time.sleep(1.0)
+                        continue
                     logger.error("[LLM] tool_use_failed could not be recovered")
                     return ChatResponse(None, None, "fatal", error_message=str(e))
 
                 # 2. Classify error
                 code = self._classify_error(e)
+
+                # Per-minute token budget exhausted (Groq: 413 "Request too
+                # large", 429 "tokens per minute"). Wait for the window and/or
+                # shrink the completion budget instead of dropping the turn.
+                tpm_error = (
+                    self._error_status(e) == 413
+                    or "request too large" in str(e).lower()
+                    or (
+                        self._error_status(e) == 429
+                        and "tokens per minute" in str(e).lower()
+                    )
+                )
+                if tpm_error:
+                    advice = _tpm_advice(str(e), max_tokens)
+                    if advice is not None and attempt < 2:
+                        wait, reduced = advice
+                        logger.warning(
+                            "[LLM] Provider TPM limit hit; waiting %.1fs, "
+                            "retrying with max_tokens=%d",
+                            wait, reduced,
+                        )
+                        if wait:
+                            time.sleep(min(wait, 65.0))
+                        max_tokens = reduced
+                        continue
+                    return ChatResponse(
+                        None, None, "error",
+                        error_message=(
+                            "Request exceeds the provider's tokens-per-minute "
+                            "limit even at the smallest output budget. "
+                            "Use a model or plan with a larger TPM limit, or "
+                            "start a new chat to shrink the context. "
+                            f"Provider said: {e}"
+                        ),
+                    )
 
                 if code == "fatal":
                     logger.error("[LLM] Fatal error: %s", e)
@@ -376,7 +536,10 @@ class BaseProvider(ABC):
         )
         recovered_dicts = _parse_failed_generation(text)
         if not recovered_dicts:
-            logger.warning("[RECOVER] failed_generation found but no pseudo-XML parsed")
+            logger.warning(
+                "[RECOVER] failed_generation found but nothing parsed (len=%d, head=%r)",
+                len(text), text[:300],
+            )
             return None
         logger.info("[RECOVER] Recovered %d tool call(s)", len(recovered_dicts))
         return ChatResponse(

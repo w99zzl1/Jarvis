@@ -1,6 +1,6 @@
 import os
 from typing import Dict, Any
-from ..base import Tool, resolve_path
+from ..base import Tool, resolve_path, python_syntax_error
 
 
 class EditFileTool(Tool):
@@ -37,15 +37,23 @@ class EditFileTool(Tool):
             if not replace_all and count > 1:
                 return {"success": False, "error": f"old_string is not unique ({count} occurrences found). Be more specific or enable replace_all."}
 
-            new_content = content.replace(old_string, new_string, 0 if replace_all else 1)
+            new_content = content.replace(old_string, new_string, -1 if replace_all else 1)
             with open(full_path, 'w', encoding='utf-8') as f:
                 f.write(new_content)
 
-            return {
+            result = {
                 "success": True,
                 "path": full_path,
                 "replacements": content.count(old_string) if replace_all else 1,
-                "bytes_written": len(new_content.encode('utf-8'))
+                "bytes_written": len(new_content.encode('utf-8')),
             }
+            syntax_error = python_syntax_error(full_path)
+            if syntax_error:
+                result["syntax_ok"] = False
+                result["warning"] = (
+                    f"Edit was applied but the file no longer parses as Python: "
+                    f"{syntax_error}. Fix it before continuing."
+                )
+            return result
         except Exception as e:
             return {"success": False, "error": str(e)}

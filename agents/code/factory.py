@@ -225,6 +225,15 @@ def create_code_agent(
             max_iterations=15,
             max_tool_calls=40,
             max_execution_time=180,
+            # Whole files must fit, but a large budget also reserves tokens
+            # against the provider's per-minute cap (Groq free tier: 8k TPM),
+            # so 2000 is the practical ceiling for ~150-line files.
+            max_output_tokens=2000,
+            # A free tier allows 5 (Google) to 30 (Groq) requests per minute,
+            # while one code task easily needs a dozen rounds. Wait out the
+            # throttle instead of dropping the user's task halfway through.
+            rate_limit_retries=20,
+            rate_limit_wait=900.0,
         ),
         event_sink=event_sink,
     )

@@ -36,9 +36,20 @@ def _invoke(fn, args: dict):
     if any(p.kind is p.VAR_POSITIONAL for p in params.values()):
         return fn(**args)
 
-    # Conventional positional tools declare the payload as `args`.
-    if len(params) == 1 and next(iter(params)) in ("args", "_args", "kwargs"):
-        return fn(args)
+    # Conventional positional tools declare the payload as `args`. They may
+    # also declare extra framework params (`on_progress`), so detect the
+    # payload name instead of requiring exactly one parameter.
+    first_name = next(iter(params))
+    first = params[first_name]
+    if (
+        first_name in ("args", "_args", "kwargs")
+        and first.kind in (first.POSITIONAL_ONLY, first.POSITIONAL_OR_KEYWORD)
+    ):
+        extra = {
+            k: v for k, v in args.items()
+            if k in params and k != first_name
+        }
+        return fn(args, **extra)
 
     accepted = {k: v for k, v in args.items() if k in params}
     missing = [

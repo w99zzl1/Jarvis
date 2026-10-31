@@ -26,6 +26,12 @@ MAX_EXECUTION_TIME_DEFAULT = 60
 # duplicate call replayed as a stub it had no way to recover.
 TOOL_OUTPUT_LIMIT = 6000
 
+# Ceiling on how long one attempt may spend idling on rate limits before giving
+# up. Per attempt; the code agent raises it in its own AgentConfig because one
+# task there needs far more provider calls than a chat reply.
+MAX_RATE_LIMIT_RETRIES = 3
+MAX_RATE_LIMIT_WAIT = 90.0
+
 
 class AgentState(Enum):
     IDLE = "idle"
@@ -53,6 +59,15 @@ class AgentConfig:
     max_execution_time: int = MAX_EXECUTION_TIME_DEFAULT
     primary_attempts: int = 2
     max_context_tokens: int = 28000
+    # Output budget per LLM call. 600 suits voice-sized answers, but a code
+    # agent must emit whole files inside one tool call: at 600 the provider
+    # truncates the arguments mid-string and Groq rejects them as invalid JSON.
+    max_output_tokens: int = 600
+    # How long one attempt may spend idling on a per-minute throttle. The main
+    # agent answers in a few calls, so a short leash keeps chat responsive; a
+    # code agent may need dozens of calls, and free tiers only allow 5-30 RPM.
+    rate_limit_retries: int = MAX_RATE_LIMIT_RETRIES
+    rate_limit_wait: float = MAX_RATE_LIMIT_WAIT
 
 
 @dataclass
@@ -193,9 +208,6 @@ _RETRY_DELAY_RE = re.compile(
 _RETRY_IN_RE = re.compile(r"retry in ([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
 _PER_DAY_RE = re.compile(r"per\s*day", re.IGNORECASE)
 
-# Ceiling on how long one turn may spend idling on rate limits before giving up.
-MAX_RATE_LIMIT_RETRIES = 3
-MAX_RATE_LIMIT_WAIT = 90.0
 
 
 @dataclass
@@ -363,20 +375,22 @@ class Agent:
             # retries) is a genuine dead end.
             rl_retries = 0
             rl_waited = 0.0
+            max_rl_retries = max(1, self.config.rate_limit_retries)
+            max_rl_wait = max(30.0, self.config.rate_limit_wait)
             while attempt.get("error") == "rate_limited":
                 info = _parse_rate_limit(attempt.get("error_message"))
                 if (
                     info is None or info.per_day
-                    or rl_retries >= MAX_RATE_LIMIT_RETRIES
-                    or rl_waited >= MAX_RATE_LIMIT_WAIT
+                    or rl_retries >= max_rl_retries
+                    or rl_waited >= max_rl_wait
                 ):
                     break
-                wait = min(max(info.delay, 1.0) + 1.5, MAX_RATE_LIMIT_WAIT - rl_waited)
+                wait = min(max(info.delay, 1.0) + 1.5, max_rl_wait - rl_waited)
                 rl_retries += 1
                 rl_waited += wait
                 logger.info(
                     "[AGENT] Rate limited (RPM); waiting %.1fs then retrying "
-                    "(retry %d/%d).", wait, rl_retries, MAX_RATE_LIMIT_RETRIES,
+                    "(retry %d/%d).", wait, rl_retries, max_rl_retries,
                 )
                 self._emit({
                     "type": "agent_message",
@@ -558,7 +572,9 @@ class Agent:
                 iter_count = iteration
                 self.state = AgentState.THINKING
 
-                max_tokens = min(self.context.calc_max_tokens(), 600)
+                max_tokens = min(
+                    self.context.calc_max_tokens(), self.config.max_output_tokens
+                )
                 messages = self.context.build(
                     provider=getattr(llm, "provider", None)
                 )

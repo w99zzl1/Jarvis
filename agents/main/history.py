@@ -208,7 +208,7 @@ class ContextBuilder:
                 total += len(func.get("arguments", "")) // 3
         return total
 
-    def build(self, query_for_retrieval: str = "", provider: str | None = None) -> list[dict]:
+    def build(self, query_for_retrieval: str = "", provider: str | None = None, aggressive: bool = False) -> list[dict]:
         messages = []
         # The newest user message is what we check for a self-reported country.
         latest_user = ""
@@ -262,7 +262,11 @@ class ContextBuilder:
         collapsed = 0
         for idx, event in enumerate(events):
             clean = self._sanitize_for_llm(event, provider)
-            if idx < last_user and event.get("role") == "tool":
+            is_tool = event.get("role") == "tool"
+            # Aggressive mode (enabled only after repeated rate-limit hits):
+            # collapse every tool result, not just those older than the last
+            # user turn. Less aggressive by default to keep full context.
+            if is_tool and (aggressive or idx < last_user):
                 # Older than the current turn: the model is not reasoning about
                 # this output any more, so replay the digest instead of the
                 # payload. A full disk report is ~2k tokens and used to be resent

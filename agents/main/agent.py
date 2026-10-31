@@ -24,7 +24,7 @@ MAX_EXECUTION_TIME_DEFAULT = 60
 # Tool output used to be cut at 150 chars, which for a directory listing left
 # the model unable to read the entries it had just asked for — and with the
 # duplicate call replayed as a stub it had no way to recover.
-TOOL_OUTPUT_LIMIT = 6000
+TOOL_OUTPUT_LIMIT = 3000
 
 # Ceiling on how long one attempt may spend idling on rate limits before giving
 # up. Per attempt; the code agent raises it in its own AgentConfig because one
@@ -246,6 +246,11 @@ class Agent:
         self._trace: ExecutionTrace | None = None
         self.verifier = Verifier()
         self._event_sink = event_sink
+        # Rate-limit pressure tracker. Trimming stays off until the
+        # provider has rejected us a couple of times in this session, so
+        # normal (non-limited) chats keep full context.
+        self._rate_limit_hits = 0
+        self._aggressive_trim = False
 
     def _make_context(self, system_prompt: str) -> ContextBuilder:
         return ContextBuilder(
@@ -378,6 +383,14 @@ class Agent:
             max_rl_retries = max(1, self.config.rate_limit_retries)
             max_rl_wait = max(30.0, self.config.rate_limit_wait)
             while attempt.get("error") == "rate_limited":
+                self._rate_limit_hits += 1
+                if self._rate_limit_hits >= 2:
+                    self._aggressive_trim = True
+                    logger.info(
+                        "[AGENT] Repeated rate limits (%d); enabling "
+                        "aggressive context trimming for this session.",
+                        self._rate_limit_hits,
+                    )
                 info = _parse_rate_limit(attempt.get("error_message"))
                 if (
                     info is None or info.per_day
@@ -576,7 +589,8 @@ class Agent:
                     self.context.calc_max_tokens(), self.config.max_output_tokens
                 )
                 messages = self.context.build(
-                    provider=getattr(llm, "provider", None)
+                    provider=getattr(llm, "provider", None),
+                    aggressive=self._aggressive_trim,
                 )
 
                 content = None
@@ -821,8 +835,9 @@ class Agent:
                 self._emit({
                     "type": "tool_finished",
                     "tool": name,
-                    "status": "replayed_cached",
+                    "status": getattr(tool_result, "status", "success"),
                     "duration": 0.0,
+                    "cached": True,
                     "attempt": attempt_index,
                     "call_id": call_id,
                 })

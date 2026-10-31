@@ -71,16 +71,19 @@ class ShellTool(Tool):
         stdout = _strip_clixml(stdout or "")
         stderr = _strip_clixml(stderr or "")
 
-        # Never hand back a silent success — that is what makes models retry forever.
+        # A command that exits 0 with no output is a legitimate result (an
+        # empty directory, a successful mkdir, a quiet build). Report it as
+        # success so the model does not treat an empty folder as a failure.
+        # Only a non-zero exit or a PowerShell error marker is a failure.
         if not stdout and not stderr and returncode == 0:
             return {
-                "success": False,
+                "success": True,
                 "returncode": 0,
                 "stdout": "",
                 "stderr": "",
-                "error": (
-                    "Command produced no output. Verify the command exists and "
-                    "produced visible output, or answer without it."
+                "note": (
+                    "Command completed successfully with no output (the "
+                    "target may be empty)."
                 ),
             }
 

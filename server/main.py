@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from routes.chat import chat_route, chat_stream
 from routes.agent import agent_route, agent_chat_stream
 from routes.code_agent import code_chat_route, code_chat_stream
+from routes.stt import transcribe_audio
 from shared.llm_client.model_fetcher import check_connected_providers_and_fetch_models, fetch_provider_models
 from shared.config_loader import get_selected_models
 from shared import agent_job
@@ -134,6 +135,16 @@ async def upload_files(files: List[UploadFile] = File(...)):
             "size": len(content),
         })
     return {"success": True, "attachments": saved}
+
+
+# ============================================================================
+# Speech-to-Text (microphone transcription via faster-whisper, local/offline)
+# ============================================================================
+
+@app.post("/stt/transcribe")
+async def stt_transcribe(file: UploadFile = File(...)):
+    """Accept a WAV/WEBM/OGG blob from the UI microphone, return transcribed text."""
+    return await transcribe_audio(file)
 
 
 # Per-launch token + CORS. See server/security.py: the API can run shell

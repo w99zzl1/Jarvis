@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef } from "react";
 import { Mic, MicOff } from "lucide-react";
 import { motion } from "motion/react";
+import { transcribeAudio } from "../api";
 
 const CYAN = "#00D9FF";
 const MONO = "'Space Mono', monospace";
@@ -17,11 +18,9 @@ export default function VoiceButton({
   onTranscript,
 }: VoiceButtonProps) {
   const [loading, setLoading] = useState(false);
-  const recognitionRef = useRef<any>(null);
-
-  const SpeechRecognition =
-    (window as any).SpeechRecognition ||
-    (window as any).webkitSpeechRecognition;
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const streamRef = useRef<MediaStream | null>(null);
 
   const toggle = useCallback(async () => {
     if (loading) return;
@@ -29,52 +28,64 @@ export default function VoiceButton({
     if (isListening) {
       setLoading(true);
       try {
-        recognitionRef.current?.stop();
+        const recorder = mediaRecorderRef.current;
+        if (recorder) {
+          recorder.stop();
+        }
+        const stream = streamRef.current;
+        if (stream) {
+          stream.getTracks().forEach((track) => track.stop());
+          streamRef.current = null;
+        }
       } catch (e) {
         console.error("Stop listening error:", e);
-      } finally {
         setIsListening(false);
         setLoading(false);
       }
     } else {
-      if (!SpeechRecognition) {
-        console.error("Web Speech API not supported in this browser");
-        setLoading(false);
-        return;
-      }
       try {
-        const recognition = new SpeechRecognition();
-        recognition.continuous = false;
-        recognition.interimResults = false;
-        recognition.lang = "ru-RU";
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        streamRef.current = stream;
 
-        recognition.onstart = () => {
-          setIsListening(true);
-        };
+        const recorder = new MediaRecorder(stream, {
+          mimeType: "audio/webm;codecs=opus",
+        });
+        mediaRecorderRef.current = recorder;
+        audioChunksRef.current = [];
 
-        recognition.onresult = (event: any) => {
-          const transcript = event.results[0][0].transcript;
-          if (transcript && transcript.trim()) {
-            onTranscript(transcript.trim());
+        recorder.ondataavailable = (event: BlobEvent) => {
+          if (event.data && event.data.size > 0) {
+            audioChunksRef.current.push(event.data);
           }
-          recognition.stop();
         };
 
-        recognition.onerror = (event: any) => {
-          console.error("Speech recognition error:", event.error);
-          recognition.stop();
+        recorder.onstop = async () => {
+          try {
+            const blob = new Blob(audioChunksRef.current, { type: "audio/webm" });
+            const file = new File([blob], "recording.webm", { type: "audio/webm" });
+            const result = await transcribeAudio(file);
+            if (result.text && result.text.trim()) {
+              onTranscript(result.text.trim());
+            }
+          } catch (e) {
+            console.error("Transcribe error:", e);
+          } finally {
+            setIsListening(false);
+            setLoading(false);
+            mediaRecorderRef.current = null;
+          }
         };
 
-        recognition.onend = () => {
+        recorder.onerror = (event) => {
+          console.error("MediaRecorder error:", event);
           setIsListening(false);
           setLoading(false);
         };
 
-        recognitionRef.current = recognition;
-        recognition.start();
+        recorder.start(100);
+        setIsListening(true);
       } catch (e) {
-        console.error("Start listening error:", e);
-        setIsListening(false);
+        console.error("Microphone access error:", e);
         setLoading(false);
       }
     }
@@ -94,26 +105,22 @@ export default function VoiceButton({
           isListening
             ? {
                 boxShadow: [
-                  `0 0 24px rgba(${rgb}, 0.35), inset 0 0 16px rgba(${rgb}, 0.08)`,
-                  `0 0 40px rgba(${rgb}, 0.55), inset 0 0 24px rgba(${rgb}, 0.15)`,
-                  `0 0 24px rgba(${rgb}, 0.35), inset 0 0 16px rgba(${rgb}, 0.08)`,
+                  "0 0 24px rgba(" + rgb + ", 0.35), inset 0 0 16px rgba(" + rgb + ", 0.08)",
+                  "0 0 40px rgba(" + rgb + ", 0.55), inset 0 0 24px rgba(" + rgb + ", 0.15)",
+                  "0 0 24px rgba(" + rgb + ", 0.35), inset 0 0 16px rgba(" + rgb + ", 0.08)",
                 ],
               }
             : {}
         }
         transition={
-          isListening
-            ? { duration: 1.5, repeat: Infinity, ease: "easeInOut" }
-            : {}
+          isListening ? { duration: 1.5, repeat: Infinity, ease: "easeInOut" } : {}
         }
         style={{
           width: 54,
           height: 54,
           borderRadius: "50%",
-          background: isListening
-            ? `rgba(${rgb}, 0.14)`
-            : "rgba(255, 255, 255, 0.04)",
-          border: `1px solid ${isListening ? `rgba(${rgb}, 0.55)` : "rgba(255,255,255,0.09)"}`,
+          background: isListening ? "rgba(" + rgb + ", 0.14)" : "rgba(255, 255, 255, 0.04)",
+          border: "1px solid " + (isListening ? "rgba(" + rgb + ", 0.55)" : "rgba(255,255,255,0.09)"),
           backdropFilter: "blur(20px)",
           display: "flex",
           alignItems: "center",
@@ -127,7 +134,7 @@ export default function VoiceButton({
             style={{
               width: 18,
               height: 18,
-              border: `2px solid transparent`,
+              border: "2px solid transparent",
               borderTopColor: CYAN,
               borderRadius: "50%",
               animation: "spin 0.8s linear infinite",

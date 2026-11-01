@@ -429,12 +429,16 @@ export async function getBackendStatus(): Promise<BackendStatus> {
   return invoke<BackendStatus>("backend_status");
 }
 
-export async function startListening(): Promise<void> {
-  await apiFetch("/stt/start", { method: "POST" }).catch(() => {});
-}
-
-export async function stopListening(): Promise<{ text: string }> {
-  return apiFetch<{ text: string }>("/stt/stop", { method: "POST" }).catch(() => ({ text: "" }));
+export async function transcribeAudio(file: File): Promise<{ text: string }> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(`${API_BASE}/stt/transcribe`, {
+    method: "POST",
+    headers: await withToken({}),
+    body: form,
+  });
+  if (!res.ok) throw new Error(`STT ${res.status}: ${res.statusText}`);
+  return res.json();
 }
 
 export function playAudioFromBase64(base64: string): Promise<void> {

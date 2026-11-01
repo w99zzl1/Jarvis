@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import io
 import logging
 import os
 import threading
@@ -19,9 +21,65 @@ import config.main as config_main
 
 log = logging.getLogger("server")
 
+# Lazy TTS engine - Silero TTS (local neural voice, Russian + English,
+# works offline after first model download, no API key).
+_tts_model = None
+
+
+def _get_tts_model():
+    global _tts_model
+    if _tts_model is not None:
+        return _tts_model
+    try:
+        from silero_tts.silero_tts import SileroTTS
+        model = SileroTTS(model_id="v4_ru", language="ru", speaker="aidar",
+                          sample_rate=48000, device="cpu")
+        _tts_model = model
+        log.info("[TTS] Silero v4_ru loaded")
+        return model
+    except Exception as e:
+        log.warning(f"[TTS] silero-tts unavailable, audio will be silent: {e}")
+        _tts_model = False
+        return None
+
+
+def _synthesize_tts(text: str) -> str | None:
+    """Return base64-encoded WAV audio for `text`, or None if TTS is unavailable."""
+    if not text:
+        return None
+    model = _get_tts_model()
+    if model is None:
+        return None
+    try:
+        import tempfile
+        import base64
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        try:
+            model.tts(text, tmp_path)
+            with open(tmp_path, "rb") as f:
+                data = f.read()
+            if data:
+                return base64.b64encode(data).decode("ascii")
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except Exception as e:
+        log.warning(f"[TTS] synthesis failed: {e}")
+    return None
+
 
 def _map_to_sse_event(internal_event: dict) -> dict | None:
     etype = internal_event.get("type")
+    
+    # Internal events (retry instructions, etc.) are needed for LLM context
+    # but must never reach the UI as visible messages.
+    if internal_event.get("internal"):
+        return None
     
     # New Execution Plan Events
     if etype == "plan_created":
@@ -231,7 +289,7 @@ async def chat_stream(user_input: str, api_keys=None,
                 bus.push({
                     "type": "final",
                     "reply": result.output,
-                    "audio": None,
+                    "audio": _synthesize_tts(result.output or ""),
                     "success": result.success,
                     "state": result.state,
                     "iterations": result.iterations,
@@ -262,7 +320,7 @@ async def chat_stream(user_input: str, api_keys=None,
                 bus.push({
                     "type": "final",
                     "reply": result.output,
-                    "audio": None,
+                    "audio": _synthesize_tts(result.output or ""),
                     "success": result.success,
                     "state": result.state,
                     "iterations": result.iterations,

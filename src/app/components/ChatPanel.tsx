@@ -139,7 +139,16 @@ export default function ChatPanel({ isListening, setIsSpeaking, fill }: ChatPane
   const [historyOpen, setHistoryOpen] = useState(false);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<{ file: FileAttachment; previewUrl: string | null }[]>([]);
-  const [dragOver, setDragOver] = useState(false);
+  const [dragOver, setDragOver] = useState(false); 
+  // Auto-scroll to bottom when messages change, only if already at bottom
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!container) return;
+    const isAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 100;
+    if (isAtBottom) {
+      container.scrollTop = container.scrollHeight;
+    }
+  }, [chat.messages]);
 
   useEffect(() => {
     chat.loadConfig();
@@ -693,3 +702,4 @@ export default function ChatPanel({ isListening, setIsSpeaking, fill }: ChatPane
     </div>
   );
 }
+

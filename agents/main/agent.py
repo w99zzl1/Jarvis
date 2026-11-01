@@ -18,13 +18,13 @@ from .tools.registry import (
 
 logger = logging.getLogger("agent")
 
-MAX_ITERATIONS_DEFAULT = 4
+MAX_ITERATIONS_DEFAULT = 15
 MAX_TOOL_CALLS_DEFAULT = 15
 MAX_EXECUTION_TIME_DEFAULT = 60
 # Tool output used to be cut at 150 chars, which for a directory listing left
 # the model unable to read the entries it had just asked for — and with the
 # duplicate call replayed as a stub it had no way to recover.
-TOOL_OUTPUT_LIMIT = 3000
+TOOL_OUTPUT_LIMIT = 6000
 
 # Ceiling on how long one attempt may spend idling on rate limits before giving
 # up. Per attempt; the code agent raises it in its own AgentConfig because one
@@ -325,11 +325,17 @@ class Agent:
                 self.log.add_user(user_input)
             elif last_record is not None:
                 reason = build_retry_reason(last_record)
-                self.log.add_user(
-                    f"[System message: this is retry attempt {attempt_index} for the primary model. "
-                    f"Previous attempt was rejected. Reason below. "
-                    f"DO NOT REPEAT the same strategy.]\n\n{reason}"
-                )
+                # Internal retry instructions - needed for LLM context but
+                # must never reach the UI as a visible user/system message.
+                self.log.add({
+                    "role": "user",
+                    "content": (
+                        f"[System message: this is retry attempt {attempt_index} for the primary model. "
+                        f"Previous attempt was rejected. Reason below. "
+                        f"DO NOT REPEAT the same strategy.]\n\n{reason}"
+                    ),
+                    "internal": True,
+                })
             # Dynamic delay before next attempt based on error type
             if last_record and last_record.error:
                 if last_record.error == "fatal":

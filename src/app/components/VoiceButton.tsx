@@ -1,7 +1,6 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import { Mic, MicOff } from "lucide-react";
 import { motion } from "motion/react";
-import { startListening, stopListening } from "../api";
 
 const CYAN = "#00D9FF";
 const MONO = "'Space Mono', monospace";
@@ -18,6 +17,11 @@ export default function VoiceButton({
   onTranscript,
 }: VoiceButtonProps) {
   const [loading, setLoading] = useState(false);
+  const recognitionRef = useRef<any>(null);
+
+  const SpeechRecognition =
+    (window as any).SpeechRecognition ||
+    (window as any).webkitSpeechRecognition;
 
   const toggle = useCallback(async () => {
     if (loading) return;
@@ -25,26 +29,55 @@ export default function VoiceButton({
     if (isListening) {
       setLoading(true);
       try {
-        const result = await stopListening();
-        setIsListening(false);
-        if (result.text && result.text.trim()) {
-          onTranscript(result.text.trim());
-        }
+        recognitionRef.current?.stop();
       } catch (e) {
         console.error("Stop listening error:", e);
-        setIsListening(false);
       } finally {
+        setIsListening(false);
         setLoading(false);
       }
-      } else {
-        try {
-          await startListening();
-          setIsListening(true);
-        } catch (e) {
-          console.error("Start listening error:", e);
-          setIsListening(false);
-        }
+    } else {
+      if (!SpeechRecognition) {
+        console.error("Web Speech API not supported in this browser");
+        setLoading(false);
+        return;
       }
+      try {
+        const recognition = new SpeechRecognition();
+        recognition.continuous = false;
+        recognition.interimResults = false;
+        recognition.lang = "ru-RU";
+
+        recognition.onstart = () => {
+          setIsListening(true);
+        };
+
+        recognition.onresult = (event: any) => {
+          const transcript = event.results[0][0].transcript;
+          if (transcript && transcript.trim()) {
+            onTranscript(transcript.trim());
+          }
+          recognition.stop();
+        };
+
+        recognition.onerror = (event: any) => {
+          console.error("Speech recognition error:", event.error);
+          recognition.stop();
+        };
+
+        recognition.onend = () => {
+          setIsListening(false);
+          setLoading(false);
+        };
+
+        recognitionRef.current = recognition;
+        recognition.start();
+      } catch (e) {
+        console.error("Start listening error:", e);
+        setIsListening(false);
+        setLoading(false);
+      }
+    }
   }, [isListening, loading, setIsListening, onTranscript]);
 
   const rgb = "0, 217, 255";

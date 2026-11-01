@@ -53,20 +53,20 @@ export interface ToolProgress {
 /** Tools whose first progress sample can take seconds, not milliseconds. */
 const SLOW_TOOLS = new Set(["disk_tree"]);
 
-const CONVERSATION_KEY = "jarvis.conversation_id";
+const CONVERSATION_KEY = (agentType: string) => `jarvis.conversation_id.${agentType}`;
 
 /** The id is persisted so an ongoing chat keeps its context across restarts. */
-function loadStoredConversationId(): string {
+function loadStoredConversationId(agentType: string): string {
   try {
-    return localStorage.getItem(CONVERSATION_KEY) || "";
+    return localStorage.getItem(CONVERSATION_KEY(agentType)) || "";
   } catch {
     return "";
   }
 }
 
-function storeConversationId(id: string): void {
+function storeConversationId(agentType: string, id: string): void {
   try {
-    localStorage.setItem(CONVERSATION_KEY, id);
+    localStorage.setItem(CONVERSATION_KEY(agentType), id);
   } catch {
     // storage unavailable; the in-memory ref still holds it for this session
   }
@@ -215,7 +215,7 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
   const idRef = useRef(0);
   const taskEventsRef = useRef<TaskStreamEvent[]>([]);
   /** Backend conversation id: kept across turns so history is not lost. */
-  const conversationIdRef = useRef<string>(loadStoredConversationId());
+  const conversationIdRef = useRef<string>(loadStoredConversationId(agentType));
   /** Aborts the in-flight SSE request when the user presses Stop. */
   const abortRef = useRef<AbortController | null>(null);
   /** Message that is currently streaming, so Stop can mark it immediately. */
@@ -434,9 +434,9 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
       let finalEvent: any = null;
       try {
         const conversationId =
-          loadStoredConversationId() || conversationIdRef.current || newConversationId();
+          loadStoredConversationId(agentType) || conversationIdRef.current || newConversationId();
         conversationIdRef.current = conversationId;
-        storeConversationId(conversationId);
+        storeConversationId(agentType, conversationId);
         const sendStreaming = agentType === "code"
           ? sendCodeChatStreaming
           : sendMainChatStreaming;

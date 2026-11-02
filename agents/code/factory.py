@@ -222,9 +222,9 @@ def create_code_agent(
         primary_llm=primary_llm,
         system_prompt=prompt,
         config=AgentConfig(
-            max_iterations=15,
-            max_tool_calls=40,
-            max_execution_time=180,
+            max_iterations=80,
+            max_tool_calls=120,
+            max_execution_time=1200,
             # Whole files must fit, but a large budget also reserves tokens
             # against the provider's per-minute cap (Groq free tier: 8k TPM),
             # so 2000 is the practical ceiling for ~150-line files.

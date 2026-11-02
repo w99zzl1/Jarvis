@@ -26,6 +26,20 @@ MAX_EXECUTION_TIME_DEFAULT = 60
 # duplicate call replayed as a stub it had no way to recover.
 TOOL_OUTPUT_LIMIT = 6000
 
+# Tool names that mutate disk/system state. After any of these runs, read-file
+# caches are invalidated so the model never replays a stale file listing or
+# content after an edit/write/shell.
+_MUTATING_TOOLS = frozenset({
+    "write_file", "write", "edit_file", "edit",
+    "shell_tool", "shell", "run_powershell", "run_cmd",
+    "git_commit", "git_push", "git_add",
+    "delete_file", "delete", "remove", "move", "rename", "copy",
+    "append_file", "append",
+})
+# Read tool name prefixes whose sig_cache entries are invalidated after a
+# mutating tool runs.
+_READ_TOOL_PREFIXES = ("read_file:", "read:", "grep:", "disk_tree:", "find_file:")
+
 # Ceiling on how long one attempt may spend idling on rate limits before giving
 # up. Per attempt; the code agent raises it in its own AgentConfig because one
 # task there needs far more provider calls than a chat reply.
@@ -822,15 +836,19 @@ class Agent:
             try:
                 args = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
+                logger.warning(
+                    f"[AGENT] Tool '{name}' had unparseable arguments, treating as empty: "
+                    f"{tc.function.arguments[:120]}"
+                )
                 args = {}
 
             narrate = args.pop("narrate", None)
             if isinstance(narrate, str) and narrate.strip():
                 self._emit({"type": "agent_message", "message": narrate.strip()})
 
-            history.append(name)
-
             sig = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
+            history.append(sig)
+
             cached = sig_cache.get(sig) if sig_cache is not None else None
             if cached is not None:
                 # Replaying the real previous result instead of a [SKIPPED]
@@ -893,6 +911,12 @@ class Agent:
 
             if sig_cache is not None:
                 sig_cache[sig] = tool_result
+            # Mutating tools invalidate read caches so the model doesn't
+            # replay stale file contents after an edit/write/shell.
+            if name in _MUTATING_TOOLS and sig_cache is not None:
+                for key in list(sig_cache.keys()):
+                    if key.startswith(_READ_TOOL_PREFIXES):
+                        sig_cache.pop(key, None)
 
             # Surface plan updates to the UI immediately.
             if name == "update_plan" and tool_result.success:
@@ -990,32 +1014,56 @@ class Agent:
         return report
 
     def _detect_loop(self, history: list[str], current: list[dict]) -> bool:
-        if len(history) < 4:
+        """Detect repetitive tool-calling loops.
+
+        `history` contains ``name:args_hash`` strings of every tool executed
+        in this turn. `current` is the list of tool calls the model just
+        requested.
+
+        Shell is exempt: repeated shell commands are normal for multi-step
+        tasks. Every other tool repeating the exact same call 4+ times
+        consecutively, or an ABAB / ABCABC alternation, is a loop.
+        """
+        if len(history) < 2:
             return False
 
-        names = [tc["function"]["name"] for tc in current]
-        if not names:
+        # Build current call signatures: name:args_hash
+        current_sigs: list[str] = []
+        for tc in current:
+            name = tc["function"]["name"]
+            try:
+                args = json.loads(tc["function"].get("arguments", "{}") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            sig = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
+            current_sigs.append(sig)
+
+        if not current_sigs:
             return False
 
-        # shell repeated 4+ times is NOT a loop — it's normal for multi-step tasks
-        if all(n == names[0] for n in history[-4:]):
-            if names[0] != "shell":
-                logger.warning(f"[LOOP] Same tool repeated 4+ times: {names[0]}")
+        # Same tool+args repeated 4+ times consecutively is a loop — unless it's
+        # shell, which is legitimate for multi-step command sequences.
+        if len(current_sigs) == 1:
+            sig = current_sigs[0]
+            name = sig.split(":", 1)[0]
+            if name != "shell":
+                recent = history[-4:]
+                if all(s == sig for s in recent):
+                    logger.warning(f"[LOOP] Same tool+args repeated 4+ times: {name}")
+                    return True
+
+        # ABAB pattern: two calls alternating.
+        if len(history) >= 4:
+            last_4 = history[-4:]
+            if last_4[0] == last_4[2] and last_4[1] == last_4[3] and last_4[0] != last_4[1]:
+                logger.warning(f"[LOOP] ABAB pattern detected: {' → '.join(last_4)}")
                 return True
 
+        # ABCABC pattern: three calls repeating.
         if len(history) >= 6:
             last_6 = history[-6:]
-            if (last_6[0] == last_6[2] == last_6[4]
-                and last_6[1] == last_6[3] == last_6[5]):
-                logger.warning(f"[LOOP] ABAB pattern detected: {' → '.join(last_6)}")
-                return True
-
-        if len(history) >= 9:
-            last_9 = history[-9:]
-            if (last_9[0] == last_9[3] == last_9[6]
-                and last_9[1] == last_9[4] == last_9[7]
-                and last_9[2] == last_9[5] == last_9[8]):
-                logger.warning(f"[LOOP] ABCABC pattern detected")
+            if last_6[0] == last_6[3] and last_6[1] == last_6[4] and last_6[2] == last_6[5]:
+                logger.warning(f"[LOOP] ABCABC pattern detected: {' → '.join(last_6)}")
                 return True
 
         return False

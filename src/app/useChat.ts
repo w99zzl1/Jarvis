@@ -314,7 +314,7 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
     taskEventsRef.current = [];
     idRef.current = msgs.length + 1;
     conversationIdRef.current = id;
-    storeConversationId(id);
+    storeConversationId(agentType, id);
   }, []);
 
   const removeConversation = useCallback(async (id: string) => {
@@ -330,7 +330,7 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
     // New chat: mint a fresh id so the backend starts from empty context.
     const fresh = newConversationId();
     conversationIdRef.current = fresh;
-    storeConversationId(fresh);
+    storeConversationId(agentType, fresh);
   }, []);
 
   const stop = useCallback(() => {
@@ -615,7 +615,7 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
         // Adopt the id the backend assigned (it generates one when we send none).
         if (finalEvent.conversation_id) {
           conversationIdRef.current = finalEvent.conversation_id;
-          storeConversationId(finalEvent.conversation_id);
+          storeConversationId(agentType, finalEvent.conversation_id);
         }
 
         const reply = finalEvent.error

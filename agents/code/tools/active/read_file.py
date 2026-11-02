@@ -35,7 +35,7 @@ class ReadFileTool(Tool):
         self.project_path = project_path
 
     def execute(self, path: str, offset: int = 0, limit: int = 100) -> Dict[str, Any]:
-        full_path = resolve_path(self.project_path, path)
+        full_path = resolve_path(self.project_path, path, sandbox=True)
 
         if not os.path.exists(full_path):
             return {"success": False, "error": f"File not found: {full_path}"}

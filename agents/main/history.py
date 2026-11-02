@@ -281,6 +281,28 @@ class ContextBuilder:
         logger.info(f"[CONTEXT] Built {len(messages)} msgs, ~{used}tok ({used/self._max_tokens*100:.0f}% of {self._max_tokens})")
         if collapsed:
             logger.info(f"[CONTEXT] {collapsed} older tool result(s) sent as summary")
+
+        # Hard trim: if we still exceed max_tokens, drop oldest non-system,
+        # non-current-turn events until we fit or run out of things to drop.
+        while used > self._max_tokens and len(messages) > 2:
+            # Never drop the system message (index 0) or the most recent
+            # user turn (find the last user event).
+            drop_idx = None
+            for i in range(1, len(messages) - 1):
+                if messages[i].get("role") != "user":
+                    drop_idx = i
+                    break
+            if drop_idx is None:
+                break
+            removed = messages.pop(drop_idx)
+            removed_text = removed.get("content", "")
+            used = self.estimate_tokens(messages)
+            logger.info(
+                f"[CONTEXT] Trimmed old event ({removed.get('role')}, "
+                f"{len(removed_text)} chars) to fit context window"
+            )
+
+        logger.info(f"[CONTEXT] Final {len(messages)} msgs, ~{used}tok ({used/self._max_tokens*100:.0f}% of {self._max_tokens})")
         return messages
 
     @staticmethod

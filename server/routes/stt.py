@@ -32,6 +32,9 @@ _WHISPER_MODEL_SIZE = os.environ.get("JARVIS_WHISPER_MODEL", "small")
 # In-memory accumulation of audio chunks per session (single-user desktop app,
 # so one buffer is sufficient; keyed by session id for future multi-user).
 _audio_buffers: dict[str, bytearray] = {}
+# Cap per-session audio bytes to prevent unbounded RAM growth.
+_MAX_SESSION_BYTES = 10 * 1024 * 1024  # 10 MB
+_MAX_SESSIONS = 5
 
 
 def _get_whisper_model():
@@ -128,7 +131,21 @@ async def stream_chunk(session_id: str, chunk_b64: str) -> dict:
         log.warning(f"[STT] invalid base64 chunk: {e}")
         return {"ok": False, "error": "invalid base64"}
 
-    buf = _audio_buffers.setdefault(session_id, bytearray())
+    # Enforce per-session byte cap to prevent unbounded RAM growth.
+    buf = _audio_buffers.get(session_id)
+    if buf is None:
+        # Enforce max session count by evicting the oldest session.
+        if len(_audio_buffers) >= _MAX_SESSIONS:
+            oldest = next(iter(_audio_buffers))
+            del _audio_buffers[oldest]
+            log.info(f"[STT] Evicted oldest session buffer: {oldest}")
+        buf = bytearray()
+        _audio_buffers[session_id] = buf
+
+    if len(buf) + len(raw) > _MAX_SESSION_BYTES:
+        log.warning(f"[STT] Session {session_id} exceeded byte cap, truncating")
+        return {"ok": False, "error": "audio buffer exceeded size limit"}
+
     buf.extend(raw)
     log.info(f"[STT] chunk {len(raw)} bytes, session total {len(buf)} bytes")
     return {"ok": True, "bytes": len(buf)}

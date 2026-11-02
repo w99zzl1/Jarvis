@@ -259,6 +259,32 @@ def _plan_progress(tool_calls_log: list[dict]) -> tuple[int, int, bool] | None:
     return completed, len(steps), work_after
 
 
+# Narration without tools: the model says "I'll create X" but never called a
+# tool. These patterns indicate future-tense prose about work that hasn't
+# happened yet — retry and let the model actually call tools.
+_NARRATION_PATTERNS = (
+    r"\bi\s*(will|'ll|gonna)\s+(create|write|make|add|edit|update|delete|remove|generate|build)\b",
+    r"\bi\s*(will|'ll|gonna)\s+(set up|put together|come up with)\b",
+    r"\bhere'?s\s+what\s+i\s*(will|'ll)\s+do\b",
+    r"\blet\s+me\s+(create|write|make|add|edit|update|delete|generate|build)\b",
+    r"\bi\s+can\s+(create|write|make|add|edit|generate|build)\b",
+)
+
+
+def _looks_like_narration(text: str | None) -> bool:
+    """True if the model's text looks like narrating future work instead of
+    reporting completed tool results.
+
+    Used in the text-only verifier path: if the model says "I'll create
+    storage.py" without ever calling write_file, it's not done — it's
+    procrastinating. Retry and let the model call tools.
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(re.search(pat, lowered) for pat in _NARRATION_PATTERNS)
+
+
 
 # ---------------------------------------------------------------------------
 # Decision
@@ -458,6 +484,18 @@ class Verifier:
                 aggregate=VerificationStatus.FAILED,
                 reason=f"fatal_agent_state:{attempt_state}|no_user_reply",
                 fatal_agent_state=True,
+            )
+
+        # Narration without tools: the model says "I'll create X" but never
+        # called a tool. That's not completion — it's procrastination. Retry
+        # and let the model actually call tools.
+        if _looks_like_narration(stripped):
+            return AttemptDecision(
+                attempt_status=AttemptStatus.RETRY,
+                tool_verifications=[],
+                aggregate=VerificationStatus.FAILED,
+                reason="text_only_narration_no_tools",
+                fatal_agent_state=fatal_state,
             )
 
         return AttemptDecision(

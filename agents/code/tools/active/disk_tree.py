@@ -208,7 +208,7 @@ class DiskTreeTool(Tool):
         except ScannerMissing as e:
             return ToolResult(status="error", error=str(e))
 
-        target = resolve_path(self.project_path, path)
+        target = resolve_path(self.project_path, path, sandbox=True)
 
         # The native walk calls this from its own worker threads while the GIL is
         # free, so it has to stay short and must never raise into the extension.

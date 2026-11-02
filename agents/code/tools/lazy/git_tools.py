@@ -39,7 +39,8 @@ class GitCommitTool(Tool):
         "type": "object",
         "properties": {
             "message": {"type": "string", "description": "Commit message"},
-            "add_all": {"type": "boolean", "default": True}
+            "add_all": {"type": "boolean", "default": False, "description": "Stage ALL changes (git add -A). Defaults to false — stage specific files instead."},
+            "path": {"type": "string", "description": "Path to the git repository (default is project root)", "default": "."}
         },
         "required": ["message"]
     }
@@ -47,7 +48,7 @@ class GitCommitTool(Tool):
     def __init__(self, project_path: str):
         self.project_path = project_path
 
-    def execute(self, message: str, add_all: bool = True, path: str = ".") -> Dict[str, Any]:
+    def execute(self, message: str, add_all: bool = False, path: str = ".") -> Dict[str, Any]:
         cwd = resolve_path(self.project_path, path)
         try:
             if add_all:

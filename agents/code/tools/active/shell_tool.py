@@ -46,7 +46,7 @@ class ShellTool(Tool):
         self.group = "always"
 
     def execute(self, command: str, path: str = ".", timeout: int = 60) -> Dict[str, Any]:
-        cwd = resolve_path(self.project_path, path)
+        cwd = resolve_path(self.project_path, path, sandbox=True)
         shell_name, shell_exe = _default_shell()
 
         try:

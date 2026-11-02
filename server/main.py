@@ -116,16 +116,22 @@ def _ensure_upload_dir():
 async def upload_files(files: List[UploadFile] = File(...)):
     """Save uploaded files to the uploads dir and return file info for the UI."""
     _ensure_upload_dir()
+    MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
     saved = []
     for f in files:
         # Sanitize filename
         safe_name = "".join(c for c in f.filename if c.isalnum() or c in "._- ") or "file"
+        # Reject path traversal or absolute paths
+        if "/" in safe_name or "\\" in safe_name or ".." in safe_name:
+            raise ValueError(f"Unsafe filename: {f.filename}")
         dest = os.path.join(_UPLOAD_DIR, safe_name)
         # Avoid collisions
         if os.path.exists(dest):
             base, ext = os.path.splitext(safe_name)
             dest = os.path.join(_UPLOAD_DIR, f"{base}_{int(time.time()*1000)}{ext}")
         content = await f.read()
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise ValueError(f"File too large: {len(content) / (1024*1024):.1f} MB (max 20 MB)")
         with open(dest, "wb") as out:
             out.write(content)
         saved.append({

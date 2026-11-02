@@ -5,7 +5,7 @@ from typing import Dict, Any
 from shared.scan_cache import LAST_SCAN_REGISTRY
 
 
-def resolve_path(project_path: str, path: str, *, allow_scan_cache: bool = True) -> str:
+def resolve_path(project_path: str, path: str, *, allow_scan_cache: bool = True, sandbox: bool = False) -> str:
     """Resolve a tool path against the project root.
 
     Absolute paths are used as-is so the agent can reach any file on the
@@ -17,10 +17,19 @@ def resolve_path(project_path: str, path: str, *, allow_scan_cache: bool = True)
     the model having to copy a long path. An ambiguous or unknown reference
     falls through untouched - resolving something we guessed at could point a
     delete at the wrong folder.
+
+    If ``sandbox`` is True (code agent), absolute paths outside ``project_path``
+    are rejected to prevent writing outside the workspace.
     """
     if not path or path == ".":
         return os.path.abspath(project_path)
     if os.path.isabs(path):
+        if sandbox:
+            abs_path = os.path.normpath(path)
+            project_abs = os.path.abspath(project_path)
+            # Allow paths inside project_path only
+            if not abs_path.startswith(project_abs + os.sep) and abs_path != project_abs:
+                return os.path.abspath(project_path)  # sandbox to project root
         return os.path.normpath(path)
 
     direct = os.path.normpath(os.path.join(project_path, path))

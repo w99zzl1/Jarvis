@@ -443,7 +443,7 @@ export async function transcribeAudio(file: File): Promise<{ text: string }> {
 
 export function playAudioFromBase64(base64: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const audio = new Audio(`data:audio/mp3;base64,${base64}`);
+    const audio = new Audio(`data:audio/wav;base64,${base64}`);
     audio.onended = () => resolve();
     audio.onerror = (e) => reject(e);
     audio.play().catch(reject);

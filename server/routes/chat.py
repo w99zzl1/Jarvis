@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import uuid
+import soundfile as sf
 from fastapi.responses import StreamingResponse
 
 from server.event_bus import DONE, EventBus, sse_stream
@@ -44,30 +45,42 @@ def _get_tts_model():
 
 
 def _synthesize_tts(text: str) -> str | None:
-    """Return base64-encoded WAV audio for `text`, or None if TTS is unavailable."""
+    """Generate speech in memory and return base64-encoded WAV audio.
+
+    Silero model produces audio directly into RAM - no temporary files on disk.
+    """
     if not text:
+        log.warning("[TTS] empty text, skipping synthesis")
         return None
     model = _get_tts_model()
     if model is None:
+        log.warning("[TTS] model unavailable, audio will be silent")
         return None
     try:
-        import tempfile
-        import base64
+        import numpy as np
 
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        tmp_path = tmp.name
-        tmp.close()
-        try:
-            model.tts(text, tmp_path)
-            with open(tmp_path, "rb") as f:
-                data = f.read()
-            if data:
-                return base64.b64encode(data).decode("ascii")
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+        # Generate audio directly in memory - no temporary file on disk
+        audio_tensor = model.tts_model.apply_tts(
+            text=text,
+            speaker=model.speaker,
+            sample_rate=model.sample_rate,
+            put_accent=model.put_accent,
+            put_yo=model.put_yo,
+        )
+        audio_np = (
+            audio_tensor.numpy()
+            if hasattr(audio_tensor, "numpy")
+            else np.asarray(audio_tensor)
+        )
+
+        buffer = io.BytesIO()
+        sf.write(buffer, audio_np, model.sample_rate, format="WAV")
+        data = buffer.getvalue()
+        if data:
+            b64 = base64.b64encode(data).decode("ascii")
+            log.info(f"[TTS] synthesized {len(data)} bytes ({len(text)} chars)")
+            return b64
+        log.warning("[TTS] empty audio output")
     except Exception as e:
         log.warning(f"[TTS] synthesis failed: {e}")
     return None
@@ -286,10 +299,12 @@ async def chat_stream(user_input: str, api_keys=None,
                 agent.set_event_sink(saving_sink)
                 result: AgentResult = agent.run(user_content)
                 conv_store.save(cid, agent.log.events)
+                _tts_audio = _synthesize_tts(result.output or "")
+                log.info(f"[CHAT] final audio={'present' if _tts_audio else 'silent'} for reply len={len(result.output or '')}")
                 bus.push({
                     "type": "final",
                     "reply": result.output,
-                    "audio": _synthesize_tts(result.output or ""),
+                    "audio": _tts_audio,
                     "success": result.success,
                     "state": result.state,
                     "iterations": result.iterations,
@@ -317,10 +332,12 @@ async def chat_stream(user_input: str, api_keys=None,
                 agent.load_history(history)
                 result: AgentResult = agent.run(user_content)
                 conv_store.save(cid, agent.log.events)
+                _tts_audio = _synthesize_tts(result.output or "")
+                log.info(f"[CHAT] final audio={'present' if _tts_audio else 'silent'} for reply len={len(result.output or '')}")
                 bus.push({
                     "type": "final",
                     "reply": result.output,
-                    "audio": _synthesize_tts(result.output or ""),
+                    "audio": _tts_audio,
                     "success": result.success,
                     "state": result.state,
                     "iterations": result.iterations,

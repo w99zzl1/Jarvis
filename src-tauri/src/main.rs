@@ -1020,6 +1020,80 @@ fn api_token(state: State<'_, AppState>) -> String {
     state.api_token.clone()
 }
 
+/// Start recording microphone audio. The backend owns the recording session;
+/// the frontend only triggers start/stop via these commands.
+#[tauri::command]
+fn audio_record_start(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    use std::collections::HashMap;
+    let session_id = format!("session-{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0));
+    // Store session id so audio_chunk knows which buffer to write to.
+    if let Ok(mut guard) = state.config.lock() {
+        // We reuse config map as a stash for session id; simpler than adding
+        // a new state field just for this.
+        guard.api_keys.insert("__stt_session__".to_string(), session_id.clone());
+    }
+    // Tell the WebView to start capturing microphone audio. Chunks flow back
+    // via the `audio_chunk` Tauri command; the backend (Python) does STT.
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit("audio:start-capture", serde_json::json!({"session_id": session_id}));
+    }
+    Ok(session_id)
+}
+
+/// Receive an audio chunk from the frontend and forward it to the Python
+/// STT backend for accumulation.
+#[tauri::command]
+async fn audio_chunk(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    data: String, // base64-encoded WebM/Opus chunk
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("http://127.0.0.1:8765/stt/stream-chunk")
+        .json(&serde_json::json!({"session_id": session_id, "chunk": data}))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("STT backend unreachable: {e}"))?;
+    let _: serde_json::Value = resp.json().await.map_err(|e| format!("STT chunk parse error: {e}"))?;
+    Ok("ok".to_string())
+}
+
+/// Stop recording and return transcribed text via Python STT backend.
+#[tauri::command]
+async fn audio_record_stop(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    // Stop the recorder on the frontend side
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit("audio:stop-capture", serde_json::json!({}));
+    }
+    // Read the session id we stashed on start.
+    let session_id = state.config.lock().unwrap()
+        .api_keys.get("__stt_session__")
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
+    // Ask Python backend to transcribe accumulated audio and return text
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("http://127.0.0.1:8765/stt/finalize")
+        .json(&serde_json::json!({"session_id": session_id}))
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|e| format!("STT backend unreachable: {e}"))?;
+    let text: serde_json::Value = resp.json().await.map_err(|e| format!("STT response parse error: {e}"))?;
+    let text_str = text.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // Clean up session
+    if let Ok(mut guard) = state.config.lock() {
+        guard.api_keys.remove("__stt_session__");
+    }
+    Ok(text_str)
+}
+
 fn main() {
     tauri::Builder::default()
         // Must be registered before other plugins: the second instance should
@@ -1132,6 +1206,9 @@ fn main() {
             set_workdir,
             backend_status,
             api_token,
+            audio_record_start,
+            audio_chunk,
+            audio_record_stop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

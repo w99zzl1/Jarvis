@@ -243,8 +243,77 @@ export default function App() {
     return () => {
       unlistenOpacity.then(u => u());
       unlistenAssistant.then(u => u());
+      unlistenAudioStart.then(u => u());
+      unlistenAudioStop.then(u => u());
     };
   }, []);
+
+  // ==========================================================
+  // AUDIO CAPTURE (microphone ? Rust ? Python STT)
+  // The frontend is only a pipe: Rust commands start/stop capture,
+  // chunks flow frontend ? Rust ? Python STT ? text back to frontend.
+  // ==========================================================
+  const [mediaRecorderRef, setMediaRecorderRef] = useRef<MediaRecorder | null>(null);
+  const [audioChunksRef, setAudioChunksRef] = useRef<Blob[]>([]);
+  const [sessionIdRef, setSessionIdRef] = useRef<string>("default");
+
+  const sendAudioChunk = useCallback(async (chunk: Blob) => {
+    try {
+      const arrayBuffer = await chunk.arrayBuffer();
+      const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+      await invoke("audio_chunk", { session_id: sessionIdRef.current, data: base64 });
+    } catch (e) {
+      console.error("[Voice] Failed to send audio chunk:", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    let unlistenStart: (() => Promise<void>) | undefined;
+    let unlistenStop: (() => Promise<void>) | undefined;
+
+    unlistenStart = listen("audio:start-capture", async (event: any) => {
+      const payload = event.payload || {};
+      const sid = payload.session_id || "default";
+      sessionIdRef.current = sid;
+      audioChunksRef.current = [];
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const recorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
+        mediaRecorderRef.current = recorder;
+
+        recorder.ondataavailable = (event: BlobEvent) => {
+          if (event.data && event.data.size > 0) {
+            audioChunksRef.current.push(event.data);
+            void sendAudioChunk(event.data);
+          }
+        };
+
+        recorder.onstop = async () => {
+          stream.getTracks().forEach((t) => t.stop());
+        };
+
+        recorder.start(100);
+      } catch (e) {
+        console.error("[Voice] Microphone access error:", e);
+      }
+    });
+
+    unlistenStop = listen("audio:stop-capture", async () => {
+      try {
+        if (mediaRecorderRef.current) {
+          mediaRecorderRef.current.stop();
+        }
+      } catch (e) {
+        console.error("[Voice] Stop recorder error:", e);
+      }
+    });
+
+    return () => {
+      unlistenStart?.then(u => u());
+      unlistenStop?.then(u => u());
+    };
+  }, [sendAudioChunk]);
 
   // Backend status: ask once on mount, then follow the Rust watchdog.
   useEffect(() => {

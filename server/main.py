@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 from routes.chat import chat_route, chat_stream
 from routes.agent import agent_route, agent_chat_stream
 from routes.code_agent import code_chat_route, code_chat_stream
-from routes.stt import transcribe_audio
+from routes.stt import transcribe_audio, stream_chunk, finalize
 from shared.llm_client.model_fetcher import check_connected_providers_and_fetch_models, fetch_provider_models
 from shared.config_loader import get_selected_models
 from shared import agent_job
@@ -145,6 +145,18 @@ async def upload_files(files: List[UploadFile] = File(...)):
 async def stt_transcribe(file: UploadFile = File(...)):
     """Accept a WAV/WEBM/OGG blob from the UI microphone, return transcribed text."""
     return await transcribe_audio(file)
+
+
+@app.post("/stt/stream-chunk")
+async def stt_stream_chunk(session_id: str, chunk: str):
+    """Accumulate a base64-encoded audio chunk from the recorder."""
+    return await stream_chunk(session_id, chunk)
+
+
+@app.post("/stt/finalize")
+async def stt_finalize(session_id: str):
+    """Transcribe all accumulated chunks for the session and clear the buffer."""
+    return await finalize(session_id)
 
 
 # Per-launch token + CORS. See server/security.py: the API can run shell

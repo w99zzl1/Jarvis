@@ -1,7 +1,7 @@
 import { useState, useCallback } from "react";
 import { Mic, MicOff } from "lucide-react";
 import { motion } from "motion/react";
-import { invoke } from "@tauri-apps/api";
+import { invoke } from "@tauri-apps/api/core";
 
 const CYAN = "#00D9FF";
 const MONO = "'Space Mono', monospace";

@@ -21,9 +21,178 @@ interface ChatPanelProps {
 
 function activityColor(a: ActivityEntry) {
   if (a.status === "failed") return "#ffb4ab";
-  if (a.status === "running") return "#00dbe9";
+  if (a.status === "running") return "var(--jarvis-hud)";
   if (a.kind === "say") return "rgba(225,226,234,0.55)";
-  return "#cfbdff";
+  return "var(--jarvis-accent-2)";
+}
+
+/** Collapsible widget for shell tool calls: shows command and output. */
+function ShellToolWidget({ activity }: { activity: ActivityEntry }) {
+  // Collapsed by default: the raw command and its output are noise most of the
+  // time, so the tab stays shut until the user asks to see it.
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const copyCommand = () => {
+    navigator.clipboard.writeText(activity.command || "");
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1200);
+  };
+
+  const statusColor = activity.status === "failed" ? "#ffb4ab" : activity.status === "running" ? "var(--jarvis-hud)" : "var(--jarvis-accent-2)";
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: "6px",
+        marginBottom: "6px",
+        border: "1px solid rgba(255,255,255,0.08)",
+        borderRadius: "8px",
+        background: "rgba(25, 28, 33, 0.4)",
+        overflow: "hidden",
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "8px",
+          padding: "8px 12px",
+          background: "none",
+          border: "none",
+          cursor: "pointer",
+          color: statusColor,
+          fontFamily: "'Space Mono', monospace",
+          fontSize: "11px",
+          fontWeight: 600,
+          textAlign: "left",
+          width: "100%",
+        }}
+      >
+        <span
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            width: "16px",
+            height: "16px",
+            borderRadius: "2px",
+            border: `1px solid ${statusColor}`,
+            fontSize: "10px",
+            lineHeight: "1",
+          }}
+        >
+          {open ? "▾" : "▸"}
+        </span>
+        <span style={{ flex: 1 }}>Оболочка</span>
+        <span style={{ fontSize: "10px", opacity: 0.6 }}>
+          {activity.status === "running" ? "выполняется…" : activity.status === "failed" ? "ошибка" : "успех"}
+        </span>
+        {activity.duration !== undefined && (
+          <span style={{ fontSize: "10px", opacity: 0.5 }}>{activity.duration.toFixed(0)} мс</span>
+        )}
+      </button>
+
+      {open && (
+        <div style={{ padding: "10px 12px", display: "flex", flexDirection: "column", gap: "8px" }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+              borderBottom: "1px solid rgba(255,255,255,0.06)",
+              paddingBottom: "6px",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                fontFamily: "'Space Mono', monospace",
+                fontSize: "10px",
+                color: "rgba(225,226,234,0.7)",
+              }}
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: "12px" }}>terminal</span>
+              <span>Command</span>
+            </div>
+            <button
+              type="button"
+              onClick={copyCommand}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "4px",
+                padding: "4px 8px",
+                background: copied ? "rgba(var(--jarvis-hud-rgb),0.2)" : "rgba(255,255,255,0.05)",
+                border: `1px solid ${copied ? "rgba(var(--jarvis-hud-rgb),0.5)" : "rgba(255,255,255,0.1)"}`,
+                borderRadius: "4px",
+                color: copied ? "var(--jarvis-hud)" : "rgba(225,226,234,0.7)",
+                fontSize: "10px",
+                fontFamily: "'Inter', sans-serif",
+                cursor: "pointer",
+              }}
+            >
+              {copied ? "скопировано" : "копировать"}
+            </button>
+          </div>
+          <div
+            style={{
+              background: "rgba(11, 14, 19, 0.6)",
+              borderRadius: "6px",
+              padding: "10px",
+              fontFamily: "'Space Mono', monospace",
+              fontSize: "11px",
+              lineHeight: "1.5",
+              color: "#e1e2ea",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-all",
+              overflowX: "auto",
+            }}
+          >
+            {activity.command || ""}
+          </div>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              fontFamily: "'Space Mono', monospace",
+              fontSize: "10px",
+              color: "rgba(225,226,234,0.7)",
+              borderTop: "1px solid rgba(255,255,255,0.06)",
+              paddingTop: "6px",
+            }}
+          >
+            <span className="material-symbols-outlined" style={{ fontSize: "12px" }}>output</span>
+            <span>Output</span>
+          </div>
+          <div
+            style={{
+              background: "rgba(11, 14, 19, 0.6)",
+              borderRadius: "6px",
+              padding: "10px",
+              fontFamily: "'Space Mono', monospace",
+              fontSize: "11px",
+              lineHeight: "1.5",
+              color: activity.status === "failed" ? "#ffb4ab" : "#e1e2ea",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-all",
+              overflowX: "auto",
+            }}
+          >
+            {activity.output || (activity.status === "running" ? "…" : "(без вывода)")}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function fmtAgo(updatedSec: number): string {
@@ -37,7 +206,7 @@ function fmtAgo(updatedSec: number): string {
   return `${days} дн назад`;
 }
 
-function HistoryDrawer({
+export function HistoryDrawer({
   open,
   onClose,
   items,
@@ -153,6 +322,12 @@ export default function ChatPanel({ isListening, setIsSpeaking, fill }: ChatPane
   useEffect(() => {
     chat.loadConfig();
     chat.refreshHistory();
+    // Resume the chat the user had open before restarting, instead of showing
+    // an empty panel while the backend still holds its context.
+    if (chat.conversationId) {
+      setActiveConversationId(chat.conversationId);
+      void chat.loadConversation(chat.conversationId);
+    }
   }, []);
 
   // Global paste handler (Ctrl+V / Cmd+V) — works when the panel is focused.
@@ -234,11 +409,14 @@ export default function ChatPanel({ isListening, setIsSpeaking, fill }: ChatPane
   };
 
   const handleSend = async () => {
-    if (!chat.input.trim() && attachments.length === 0) return;
+    // Stop must be reachable while a turn is running, when the input is
+    // normally empty. Checking the input first silently swallowed the Stop
+    // click; check the running state first instead.
     if (chat.isExecuting || chat.loading) {
       chat.stop();
       return;
     }
+    if (!chat.input.trim() && attachments.length === 0) return;
     try {
       await chat.sendWithAttachments(attachments.map((a) => a.file));
     } finally {
@@ -285,13 +463,13 @@ export default function ChatPanel({ isListening, setIsSpeaking, fill }: ChatPane
           style={{
             position: "absolute",
             inset: 0,
-            background: "rgba(0, 240, 255, 0.15)",
-            border: "2px dashed rgba(0, 240, 255, 0.5)",
+            background: "rgba(var(--jarvis-hud-rgb), 0.15)",
+            border: "2px dashed rgba(var(--jarvis-hud-rgb), 0.5)",
             zIndex: 50,
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            color: "#00f0ff",
+            color: "var(--jarvis-hud)",
             fontWeight: "bold",
             fontSize: "14px",
             backdropFilter: "blur(4px)",
@@ -326,11 +504,11 @@ export default function ChatPanel({ isListening, setIsSpeaking, fill }: ChatPane
                   padding: "6px 10px",
                   borderRadius: "8px",
                   background: img
-                    ? "rgba(0, 240, 255, 0.12)"
+                    ? "rgba(var(--jarvis-hud-rgb), 0.12)"
                     : "rgba(255, 255, 255, 0.06)",
                   border: `1px solid ${
                     img
-                      ? "rgba(0, 240, 255, 0.35)"
+                      ? "rgba(var(--jarvis-hud-rgb), 0.35)"
                       : "rgba(255, 255, 255, 0.12)"
                   }`,
                   fontSize: "11px",
@@ -353,7 +531,7 @@ export default function ChatPanel({ isListening, setIsSpeaking, fill }: ChatPane
                 ) : img ? (
                   <ImageIcon
                     size={12}
-                    style={{ color: "rgba(0, 240, 255, 0.8)" }}
+                    style={{ color: "rgba(var(--jarvis-hud-rgb), 0.8)" }}
                   />
                 ) : null}
                 <span title={file.name} style={{ maxWidth: "120px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -449,7 +627,7 @@ export default function ChatPanel({ isListening, setIsSpeaking, fill }: ChatPane
                     style={{
                       marginBottom: msg.text ? "8px" : 0,
                       paddingBottom: msg.text ? "8px" : 0,
-                      borderBottom: msg.text ? "1px solid rgba(0, 240, 255, 0.15)" : "none",
+                      borderBottom: msg.text ? "1px solid rgba(var(--jarvis-hud-rgb), 0.15)" : "none",
                       display: "flex",
                       flexDirection: "column",
                       gap: "3px",
@@ -470,16 +648,22 @@ export default function ChatPanel({ isListening, setIsSpeaking, fill }: ChatPane
                           fontStyle: a.kind === "say" ? "italic" : "normal",
                         }}
                       >
-                        <span style={{ flexShrink: 0, opacity: 0.8 }}>
-                          {a.kind === "say"
-                            ? "›"
-                            : a.status === "running"
-                            ? "▸"
-                            : a.status === "failed"
-                            ? "✕"
-                            : "•"}
-                        </span>
-                        <span style={{ wordBreak: "break-word" }}>{a.text}</span>
+                        {a.command ? (
+                          <ShellToolWidget activity={a} />
+                        ) : (
+                          <>
+                            <span style={{ flexShrink: 0, opacity: 0.8 }}>
+                              {a.kind === "say"
+                                ? "›"
+                                : a.status === "running"
+                                ? "▸"
+                                : a.status === "failed"
+                                ? "✕"
+                                : "•"}
+                            </span>
+                            <span style={{ wordBreak: "break-word" }}>{a.text}</span>
+                          </>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -521,7 +705,7 @@ export default function ChatPanel({ isListening, setIsSpeaking, fill }: ChatPane
                           ) : img ? (
                             <ImageIcon
                               size={16}
-                              style={{ color: "rgba(0, 240, 255, 0.8)" }}
+                              style={{ color: "rgba(var(--jarvis-hud-rgb), 0.8)" }}
                             />
                           ) : null}
                           {!img && (
@@ -535,9 +719,29 @@ export default function ChatPanel({ isListening, setIsSpeaking, fill }: ChatPane
                   </div>
                 )}
 
+                {msg.error && (
+                  <div
+                    style={{
+                      marginTop: msg.text ? "8px" : 0,
+                      padding: "8px 10px",
+                      borderRadius: "8px",
+                      background: "rgba(255, 180, 171, 0.10)",
+                      border: "1px solid rgba(255, 180, 171, 0.35)",
+                      color: "#ffb4ab",
+                      fontFamily: "'Space Mono', monospace",
+                      fontSize: "11px",
+                      lineHeight: "1.45",
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                    }}
+                  >
+                    <strong style={{ fontWeight: 600 }}>Ошибка:</strong> {msg.error}
+                  </div>
+                )}
+
                 {msg.text ? (
                   <Markdown text={cleanText(msg.text)} />
-                ) : chat.isExecuting && msg.id === chat.messages[chat.messages.length - 1]?.id ? (
+                ) : !msg.error && chat.isExecuting && msg.id === chat.messages[chat.messages.length - 1]?.id ? (
                   <span
                     style={{
                       opacity: 0.5,
@@ -555,6 +759,67 @@ export default function ChatPanel({ isListening, setIsSpeaking, fill }: ChatPane
           ))}
         </AnimatePresence>
       </div>
+
+      {/* Rate Limit Indicator */}
+      {chat.rateLimitState && chat.rateLimitState.phase && (
+        <div
+          style={{
+            padding: "8px 12px",
+            margin: "0 4px 8px",
+            borderRadius: "8px",
+            background: "rgba(255, 180, 0, 0.15)",
+            border: "1px solid rgba(255, 180, 0, 0.4)",
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            fontSize: "11px",
+            fontFamily: "'Space Mono', monospace",
+            color: "#ffb400",
+          }}
+        >
+          <span className="material-symbols-outlined" style={{ fontSize: "14px" }}>hourglass_empty</span>
+          <span style={{ flex: 1 }}>
+            {chat.rateLimitState.phase === "waiting" && (
+              <>
+                ⏳ Rate limit on <b>{chat.rateLimitState.provider}</b> — waiting{" "}
+                <b>{chat.rateLimitState.wait_seconds}s</b>...
+              </>
+            )}
+            {chat.rateLimitState.phase === "fallback" && (
+              <>
+                🔄 Falling back to <b>{chat.rateLimitState.fallback_provider}</b>...
+              </>
+            )}
+            {chat.rateLimitState.phase === "exhausted" && (
+              <>
+                ⚠️ Rate limit exhausted on <b>{chat.rateLimitState.provider}</b>
+              </>
+            )}
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              if (chat.rateLimitIntervalRef && chat.rateLimitIntervalRef.current) {
+                clearInterval(chat.rateLimitIntervalRef.current);
+                chat.rateLimitIntervalRef.current = null;
+              }
+              chat.stop();
+            }}
+            style={{
+              background: "rgba(255, 180, 0, 0.2)",
+              border: "1px solid rgba(255, 180, 0, 0.4)",
+              color: "#ffb400",
+              padding: "2px 8px",
+              borderRadius: "4px",
+              fontSize: "10px",
+              cursor: "pointer",
+              fontFamily: "'Space Mono', monospace",
+            }}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
 
       <div style={{ padding: "0 4px" }} data-no-drag>
         <ModelSelector
@@ -625,7 +890,7 @@ export default function ChatPanel({ isListening, setIsSpeaking, fill }: ChatPane
             outline: "none",
             transition: "border-color 0.2s",
           }}
-          onFocus={(e) => (e.target.style.borderColor = "rgba(0, 240, 255, 0.4)")}
+          onFocus={(e) => (e.target.style.borderColor = "rgba(var(--jarvis-hud-rgb), 0.4)")}
           onBlur={(e) => (e.target.style.borderColor = "rgba(255,255,255,0.08)")}
         />
         <input
@@ -661,7 +926,7 @@ export default function ChatPanel({ isListening, setIsSpeaking, fill }: ChatPane
               (chat.isExecuting || chat.loading)
                 ? "rgba(255,180,171,0.9)"
                 : (chat.input.trim() || attachments.length > 0)
-                ? "linear-gradient(135deg, #00f0ff, #00dbe9)"
+                ? "linear-gradient(135deg, var(--jarvis-hud), var(--jarvis-hud))"
                 : "rgba(255,255,255,0.03)",
             color: (chat.isExecuting || chat.loading) ? "#690005" : (chat.input.trim() || attachments.length > 0) ? "#002022" : "rgba(255,255,255,0.2)",
             cursor: (chat.isExecuting || chat.loading) || chat.input.trim() || attachments.length > 0 ? "pointer" : "default",
@@ -669,7 +934,7 @@ export default function ChatPanel({ isListening, setIsSpeaking, fill }: ChatPane
             alignItems: "center",
             justifyContent: "center",
             flexShrink: 0,
-            boxShadow: (chat.isExecuting || chat.loading) ? "0 0 12px rgba(255,180,171,0.25)" : (chat.input.trim() || attachments.length > 0) ? "0 0 16px rgba(0,240,255,0.35)" : "none",
+            boxShadow: (chat.isExecuting || chat.loading) ? "0 0 12px rgba(255,180,171,0.25)" : (chat.input.trim() || attachments.length > 0) ? "0 0 16px rgba(var(--jarvis-hud-rgb),0.35)" : "none",
             transition: "all 0.2s",
           }}
           title={(chat.isExecuting || chat.loading) ? "Stop agent" : attachments.length > 0 ? `Отправить с ${attachments.length} вложением(ями)` : "Send"}

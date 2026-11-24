@@ -20,7 +20,7 @@ class WriteFileTool(Tool):
         self.project_path = project_path
 
     def execute(self, path: str, content: str, append: bool = False) -> Dict[str, Any]:
-        full_path = resolve_path(self.project_path, path, sandbox=True)
+        full_path = resolve_path(self.project_path, path)
 
         try:
             os.makedirs(os.path.dirname(full_path), exist_ok=True)

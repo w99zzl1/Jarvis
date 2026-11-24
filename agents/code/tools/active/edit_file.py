@@ -21,7 +21,7 @@ class EditFileTool(Tool):
         self.project_path = project_path
 
     def execute(self, path: str, old_string: str, new_string: str, replace_all: bool = False) -> Dict[str, Any]:
-        full_path = resolve_path(self.project_path, path, sandbox=True)
+        full_path = resolve_path(self.project_path, path)
 
         if not os.path.exists(full_path):
             return {"success": False, "error": f"File not found: {full_path}"}

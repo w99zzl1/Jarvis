@@ -1,12 +1,18 @@
-import React, { useState, useCallback, useEffect, useRef } from "react";
-import { Settings, Bot } from "lucide-react";
-import { motion } from "motion/react";
-import JarvisCore from "./components/JarvisCore";
-import ChatPanel from "./components/ChatPanel";
-import Dashboard from "./components/Dashboard";
-import VoiceButton from "./components/VoiceButton";
-import { sendVoiceChat, playAudioFromBase64, getBackendStatus } from "./api";
+import { useState, useCallback, useEffect, useRef } from "react";
+import AetherAgent from "./components/AetherAgent";
+import VoiceCore from "./components/VoiceCore";
+import SettingsView from "./components/SettingsView";
+import { getBackendStatus } from "./api";
 import type { BackendStatus } from "./api";
+import {
+  applyOpacityCss,
+  applyTheme,
+  DEFAULT_THEME,
+  getTheme,
+  normalizeTheme,
+  setTheme as persistTheme,
+  type ThemeId,
+} from "./theme";
 
 import {
   emit,
@@ -16,10 +22,6 @@ import {
 import {
   invoke,
 } from "@tauri-apps/api/core";
-
-const CYAN = "#00D9FF";
-const VIOLET = "#8B5CFF";
-const MONO = "'Space Mono', monospace";
 
 // Controls that must never drag the window.
 const DRAG_EXCLUDE =
@@ -50,144 +52,6 @@ const shouldBlockDrag = (el: Element | null): boolean => {
 let isGloballyDragging = false;
 
 // ============================================================
-// WINDOW GEOMETRY
-// ============================================================
-
-const MAIN_W = 427;
-const WINDOW_H = 759;
-
-// ============================================================
-// GLASS BUTTON
-// ============================================================
-
-function GlassButton({
-  icon,
-  label,
-  active,
-  onClick,
-  accentColor,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  active?: boolean;
-  onClick?: () => void;
-  accentColor: string;
-}) {
-  const rgb =
-    accentColor === CYAN
-      ? "0, 217, 255"
-      : "139, 92, 255";
-
-  return (
-    <button
-      onClick={onClick}
-      style={{
-        background: "none",
-        border: "none",
-        cursor: "pointer",
-        padding: 0,
-      }}
-      className="flex flex-col items-center gap-2.5"
-    >
-      <motion.div
-        whileTap={{ scale: 0.93 }}
-        style={{
-          width: 54,
-          height: 54,
-          borderRadius: "50%",
-          background: active
-            ? `rgba(${rgb}, 0.14)`
-            : "rgba(255, 255, 255, 0.04)",
-          border: `1px solid ${
-            active
-              ? `rgba(${rgb}, 0.55)`
-              : "rgba(255,255,255,0.09)"
-          }`,
-          backdropFilter: "blur(20px)",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          color: active
-            ? accentColor
-            : "rgba(255,255,255,0.42)",
-          boxShadow: active
-            ? `0 0 24px rgba(${rgb}, 0.35),
-               inset 0 0 16px rgba(${rgb}, 0.08)`
-            : "none",
-          transition: "all 0.3s ease",
-        }}
-      >
-        {icon}
-      </motion.div>
-
-      <span
-        style={{
-          color: "rgba(255,255,255,0.22)",
-          fontSize: "9px",
-          letterSpacing: "0.22em",
-          textTransform: "uppercase",
-          fontFamily: MONO,
-        }}
-      >
-        {label}
-      </span>
-    </button>
-  );
-}
-
-
-// ============================================================
-// WINDOW HELPERS
-// ============================================================
-
-async function safeCloseWindow(win: any) {
-  if (!win) return;
-
-  try {
-    await win.close();
-  } catch {
-    try {
-      await win.destroy();
-    } catch {
-      // already gone
-    }
-  }
-}
-
-// ============================================================
-// CROP MARKS (viewfinder / corner brackets)
-// ============================================================
-
-function CropMarks({
-  color = CYAN,
-  inset = 10,
-  size = 16,
-  thickness = 2,
-}: {
-  color?: string;
-  inset?: number;
-  size?: number;
-  thickness?: number;
-}) {
-  const common: React.CSSProperties = {
-    position: "absolute",
-    width: size,
-    height: size,
-    pointerEvents: "none",
-    zIndex: 60,
-  };
-  const b = `solid ${thickness}px ${color}`;
-  return (
-    <>
-      <span style={{ ...common, top: inset, left: inset, borderTop: b, borderLeft: b }} />
-      <span style={{ ...common, top: inset, right: inset, borderTop: b, borderRight: b }} />
-      <span style={{ ...common, bottom: inset, left: inset, borderBottom: b, borderLeft: b }} />
-      <span style={{ ...common, bottom: inset, right: inset, borderBottom: b, borderRight: b }} />
-    </>
-  );
-}
-
-// ============================================================
 // APP
 // ============================================================
 
@@ -201,10 +65,9 @@ export default function App() {
   // In the assistant window we ARE the visible assistant, so Ctrl+D there has
   // to mean "go back to the desktop", not "open myself again".
   const [isAssistantVisible, setIsAssistantVisible] = useState(isAssistantView);
-  const [isSettingsVisible, setIsSettingsVisible] = useState(false);
   const [opacity, setOpacity] = useState(0.72);
+  const [theme, setThemeState] = useState<ThemeId>(DEFAULT_THEME);
 
-  const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
 
   // Local Python backend: Rust launches it and watches /health. A packaged
@@ -221,15 +84,32 @@ export default function App() {
   // ==========================================================
 
   const assistantVisibleRef = useRef(isAssistantView);
-  const settingsVisibleRef = useRef(false);
 
-  // Load persisted opacity on mount
+  // Load persisted window appearance on mount. Rust already injected both
+  // values before React painted; these effects keep React state and the CSS
+  // variables in sync for the rest of the session.
   useEffect(() => {
-    invoke("get_opacity").then((o: number) => setOpacity(o)).catch(() => {});
-    
-    // Listen for opacity changes from Rust
-    const unlistenOpacity = listen("opacity-changed", (event: any) => {
+    invoke("get_opacity")
+      .then((o: number) => {
+        setOpacity(o);
+        applyOpacityCss(o);
+      })
+      .catch(() => applyOpacityCss(0.72));
+
+    getTheme().then((t) => {
+      setThemeState(t);
+      applyTheme(t);
+    });
+
+    const unlistenOpacity = listen<number>("opacity-changed", (event) => {
       setOpacity(event.payload);
+      applyOpacityCss(event.payload);
+    });
+
+    const unlistenTheme = listen<unknown>("theme-changed", (event) => {
+      const next = normalizeTheme(event.payload);
+      setThemeState(next);
+      applyTheme(next);
     });
 
     // The assistant can also be closed from its own window, so the main
@@ -242,78 +122,13 @@ export default function App() {
 
     return () => {
       unlistenOpacity.then(u => u());
+      unlistenTheme.then(u => u());
       unlistenAssistant.then(u => u());
-      unlistenAudioStart.then(u => u());
-      unlistenAudioStop.then(u => u());
     };
   }, []);
 
-  // ==========================================================
-  // AUDIO CAPTURE (microphone ? Rust ? Python STT)
-  // The frontend is only a pipe: Rust commands start/stop capture,
-  // chunks flow frontend ? Rust ? Python STT ? text back to frontend.
-  // ==========================================================
-  const [mediaRecorderRef, setMediaRecorderRef] = useRef<MediaRecorder | null>(null);
-  const [audioChunksRef, setAudioChunksRef] = useRef<Blob[]>([]);
-  const [sessionIdRef, setSessionIdRef] = useRef<string>("default");
-
-  const sendAudioChunk = useCallback(async (chunk: Blob) => {
-    try {
-      const arrayBuffer = await chunk.arrayBuffer();
-      const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
-      await invoke("audio_chunk", { session_id: sessionIdRef.current, data: base64 });
-    } catch (e) {
-      console.error("[Voice] Failed to send audio chunk:", e);
-    }
-  }, []);
-
-  useEffect(() => {
-    let unlistenStart: (() => Promise<void>) | undefined;
-    let unlistenStop: (() => Promise<void>) | undefined;
-
-    unlistenStart = listen("audio:start-capture", async (event: any) => {
-      const payload = event.payload || {};
-      const sid = payload.session_id || "default";
-      sessionIdRef.current = sid;
-      audioChunksRef.current = [];
-
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const recorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
-        mediaRecorderRef.current = recorder;
-
-        recorder.ondataavailable = (event: BlobEvent) => {
-          if (event.data && event.data.size > 0) {
-            audioChunksRef.current.push(event.data);
-            void sendAudioChunk(event.data);
-          }
-        };
-
-        recorder.onstop = async () => {
-          stream.getTracks().forEach((t) => t.stop());
-        };
-
-        recorder.start(100);
-      } catch (e) {
-        console.error("[Voice] Microphone access error:", e);
-      }
-    });
-
-    unlistenStop = listen("audio:stop-capture", async () => {
-      try {
-        if (mediaRecorderRef.current) {
-          mediaRecorderRef.current.stop();
-        }
-      } catch (e) {
-        console.error("[Voice] Stop recorder error:", e);
-      }
-    });
-
-    return () => {
-      unlistenStart?.then(u => u());
-      unlistenStop?.then(u => u());
-    };
-  }, [sendAudioChunk]);
+  // Audio capture now lives in `audioCapture.ts`, owned by the window whose
+  // voice button was pressed (see VoiceCore / AetherAgent).
 
   // Backend status: ask once on mount, then follow the Rust watchdog.
   useEffect(() => {
@@ -339,53 +154,9 @@ export default function App() {
     await invoke(next ? "show_assistant" : "hide_assistant");
   }, [isAssistantVisible]);
 
-  // The Assistant button is a press-plate, not a lever: it only ever opens the
-  // console. Closing happens from the assistant window itself.
-  const openAssistant = useCallback(async () => {
-    if (assistantVisibleRef.current) return;
-    assistantVisibleRef.current = true;
-    setIsAssistantVisible(true);
-    await invoke("show_assistant");
-  }, []);
-
-  const toggleSettingsWindow = useCallback(async () => {
-    const next = !isSettingsVisible;
-    setIsSettingsVisible(next);
-    settingsVisibleRef.current = next;
-    await invoke(next ? "show_settings" : "hide_settings");
-  }, [isSettingsVisible]);
-
   // ==========================================================
   // VOICE
   // ==========================================================
-
-  const handleVoiceTranscript =
-    useCallback(
-      async (text: string) => {
-        if (!text) return;
-
-        try {
-          setIsSpeaking(true);
-
-          const resp =
-            await sendVoiceChat(text);
-
-          if (resp.audio) {
-            await playAudioFromBase64(
-              resp.audio
-            );
-          }
-        } catch (e) {
-          console.error(
-            "Voice chat error:",
-            e
-          );
-        } finally {
-          setIsSpeaking(false);
-        }
-      },
-      []
-    );
 
   // ==========================================================
   // CONNECTOR VIEW - REMOVED
@@ -512,8 +283,7 @@ export default function App() {
         }
       `}</style>
 
-        <Dashboard
-          isListening={isListening}
+        <AetherAgent
           isSpeaking={isSpeaking}
           setIsSpeaking={setIsSpeaking}
         />
@@ -525,132 +295,22 @@ export default function App() {
   // SETTINGS VIEW
   // ==========================================================
 
-// ==========================================================
-// SETTINGS VIEW
-// ==========================================================
-
-if (isSettingsView) {
-    const setOpacityVal = async (val: number) => {
-      const v = Math.round(val * 100) / 100;
-      await invoke("set_opacity", { opacity: v });
-    };
-    const resetOpacity = async () => {
-      await invoke("set_opacity", { opacity: 1 });
-    };
-
+  if (isSettingsView) {
     return (
-      <><style>{`
-        html,
-        body,
-        #root {
-          margin: 0 !important;
-          padding: 0 !important;
-          width: 100% !important;
-          height: 100% !important;
-          background: transparent !important;
-          overflow: hidden !important;
-        }
-      `}</style>
-        <div
-          style={{
-            width: "100%",
-            height: "100%",
-            position: "fixed",
-            top: 0,
-            left: 0,
-            zIndex: 0,
-          }}
-        />
-
-          <div
-          data-panel-bg
-          style={{
-            width: "100%",
-            height: "100%",
-            background: `rgba(1, 4, 8, ${opacity})`,
-            display: "flex",
-            flexDirection: "column",
-            justifyContent: "flex-start",
-            padding: "16px",
-            boxSizing: "border-box",
-            fontFamily: MONO,
-            color: "rgba(255,255,255,0.85)",
-            position: "relative",
-            zIndex: 1,
-          }}
-        >
-          <CropMarks color={VIOLET} />
-<div
-              style={{
-                fontSize: "13px",
-                letterSpacing: "0.22em",
-                textTransform: "uppercase",
-                color: VIOLET,
-                marginBottom: "14px",
-              }}
-            >
-            Settings
-          </div>
-
-          {/* Existing Settings */}
-          <div style={{ marginBottom: "18px" }}>
-            <div
-              style={{
-                fontSize: "10px",
-                letterSpacing: "0.15em",
-                textTransform: "uppercase",
-                color: "rgba(255,255,255,0.5)",
-                marginBottom: "8px",
-              }}
-            >
-              Прозрачность: {Math.round(opacity * 100)}%
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-              <input
-                type="range"
-                min={10}
-                max={100}
-                value={Math.round(opacity * 100)}
-                onChange={(e) => setOpacityVal(Number(e.target.value) / 100)}
-                style={{ flex: 1, cursor: "pointer" }}
-              />
-              <button
-                onClick={resetOpacity}
-                title="Reset to 100%"
-                aria-label="Reset opacity"
-                style={{
-                  background: "none",
-                  border: "1px solid rgba(139,92,255,0.6)",
-                  borderRadius: "50%",
-                  width: 24,
-                  height: 24,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  cursor: "pointer",
-                  padding: 0,
-                  color: VIOLET,
-                  flexShrink: 0,
-                }}
-              >
-                <svg
-                  width="12"
-                  height="12"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2.5"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <path d="M1 4v6h6" />
-                  <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
-                </svg>
-              </button>
-            </div>
-          </div>
-        </div>
-      </>
+      <SettingsView
+        opacity={opacity}
+        theme={theme}
+        onOpacityChange={(v) => {
+          const rounded = Math.round(v * 100) / 100;
+          void invoke("set_opacity", { opacity: rounded });
+        }}
+        onOpacityReset={() => void invoke("set_opacity", { opacity: 1 })}
+        onThemeChange={(next) => {
+          applyTheme(next);
+          setThemeState(next);
+          void persistTheme(next).catch(() => {});
+        }}
+      />
     );
   }
 
@@ -677,194 +337,11 @@ if (isSettingsView) {
         }
       `}</style>
 
-      <div
-        style={{
-          width: "100%",
-          height: "100%",
-          position: "fixed",
-          top: 0,
-          left: 0,
-          zIndex: 0,
-        }}
+      <VoiceCore
+        isSpeaking={isSpeaking}
+        setIsSpeaking={setIsSpeaking}
+        backend={backend}
       />
-
-      <div
-        style={{
-          width: "100%",
-          height: "100%",
-          position: "relative",
-          zIndex: 1,
-        }}
-      >
-         {/* MAIN AREA — fixed "frame", never resizes */}
-         <div
-           data-panel-bg
-           style={{
-             position: "absolute",
-             top: 0,
-             left: 0,
-             width: MAIN_W,
-             height: WINDOW_H,
-
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "center",
-            justifyContent: "space-between",
-            overflow: "hidden",
-            fontFamily: MONO,
-            paddingTop: "16px",
-            paddingBottom: "12px",
-            paddingLeft: "24px",
-            paddingRight: "24px",
-            background: `rgba(1, 4, 8, ${opacity})`,
-            borderRadius: 0,
-          }}
-        >
-          <CropMarks color={CYAN} />
-          {/* ... MAIN CONTENT ... */}
-          <div
-            className="flex flex-col items-center gap-1.5 z-10"
-            style={{
-              marginTop: "8px",
-            }}
-          >
-            <motion.p
-              style={{
-                color: backend.failed ? "#FF5C7A" : CYAN,
-                letterSpacing: "0.46em",
-                fontSize: "9.5px",
-                opacity: 0.4,
-                fontFamily: MONO,
-              }}
-              animate={{
-                opacity: isSpeaking
-                  ? [0.4, 0.9, 0.4]
-                  : [0.4, 0.7, 0.4],
-              }}
-              transition={{
-                duration:
-                  isSpeaking
-                    ? 1.0
-                    : 3.5,
-                repeat: Infinity,
-                ease: "easeInOut",
-              }}
-            >
-              {isSpeaking
-                ? "SPEAKING"
-                : isListening
-                ? "LISTENING"
-                : backend.failed
-                ? "BACKEND OFFLINE"
-                : backend.ready
-                ? "SYSTEM ONLINE"
-                : "STARTING BACKEND"}
-            </motion.p>
-
-            <h1
-              style={{
-                color:
-                  "rgba(255,255,255,0.85)",
-                letterSpacing:
-                  "0.42em",
-                fontSize: "19px",
-                fontWeight: 400,
-                fontFamily: MONO,
-                margin: 0,
-              }}
-            >
-              JARVIS
-            </h1>
-          </div>
-
-          {backend.failed && (
-            <div
-              data-no-drag
-              title={backend.message}
-              style={{
-                width: "100%",
-                margin: "4px 0 6px",
-                padding: "6px 8px",
-                border: "1px solid rgba(255,92,122,0.5)",
-                background: "rgba(255,92,122,0.07)",
-                color: "rgba(255,196,206,0.9)",
-                fontFamily: MONO,
-                fontSize: "9px",
-                lineHeight: 1.45,
-                textAlign: "center",
-                overflow: "hidden",
-                display: "-webkit-box",
-                WebkitLineClamp: 3,
-                WebkitBoxOrient: "vertical",
-              }}
-            >
-              {backend.message || "The local backend is not running."}
-            </div>
-          )}
-
-          {/* CORE */}
-
-          <div
-            className="flex-1 flex items-center justify-center z-10"
-            style={{
-              width: "100%",
-              maxWidth: "95%",
-              minHeight: 0,
-            }}
-          >
-            <JarvisCore />
-          </div>
-
-          {/* BOTTOM */}
-
-          <div
-            className="w-full z-10 flex flex-col gap-0"
-            style={{
-              marginBottom: "8px",
-            }}
-          >
-            <div
-              style={{
-                marginBottom: "12px",
-              }}
-            >
-              <ChatPanel
-                isListening={isListening}
-                isSpeaking={isSpeaking}
-                setIsSpeaking={setIsSpeaking}
-              />
-            </div>
-
-            <div className="flex w-full justify-between items-end">
-              <div className="flex items-end gap-4">
-                <VoiceButton
-                  isListening={isListening}
-                  setIsListening={setIsListening}
-                  onTranscript={handleVoiceTranscript}
-                />
-
-                <GlassButton
-                  icon={<Bot size={18} />}
-                  label="Assistant"
-                  accentColor={CYAN}
-                  onClick={openAssistant}
-                />
-              </div>
-
-              <GlassButton
-                icon={<Settings size={18} />}
-                label="Settings"
-                accentColor={VIOLET}
-                onClick={toggleSettingsWindow}
-                active={isSettingsVisible}
-              />
-            </div>
-          </div>
-        </div>
-
-        {/* ASSISTANT and SETTINGS now live in their own
-            WebViewWindows (assistant / settings) */}
-      </div>
     </>
   );
 }

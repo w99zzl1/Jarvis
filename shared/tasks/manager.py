@@ -118,10 +118,18 @@ class TaskManager:
 
     def run_in_background(self, proc: subprocess.Popen,
                           command: str,
-                          task_type: TaskType = TaskType.CUSTOM) -> Task:
+                          task_type: TaskType = TaskType.CUSTOM,
+                          cleanup: Callable[[], None] | None = None,
+                          output_parser: Callable[[str], str] | None = None) -> Task:
         """
         Запустить процесс в фоне и отслеживать прогресс.
         Возвращает Task с task_id сразу (процесс выполняется в потоке).
+
+        `cleanup` runs after the monitored process finishes. Shell callers use
+        it to remove their temporary wrapper scripts: deleting them at handoff
+        made a background PowerShell process fail before it read the script.
+        `output_parser` normalizes the final output before it is stored; the
+        shell runner uses it to hide its own exit-code sentinel.
         """
         task = self.create_task(task_type, command, pid=proc.pid)
         task.update(status=TaskStatus.RUNNING)
@@ -130,14 +138,25 @@ class TaskManager:
         future = self._executor.submit(
             self._monitor_process,
             task,
-            proc
+            proc,
+            output_parser,
         )
         self._futures[task.id] = future
-        future.add_done_callback(lambda f: self._on_task_done(task.id))
-        
+
+        def _finished(f: Future):
+            if cleanup is not None:
+                try:
+                    cleanup()
+                except Exception:
+                    pass
+            self._on_task_done(task.id)
+
+        future.add_done_callback(_finished)
+
         return task
 
-    def _monitor_process(self, task: Task, proc: subprocess.Popen):
+    def _monitor_process(self, task: Task, proc: subprocess.Popen,
+                         output_parser: Callable[[str], str] | None = None):
         """Мониторит процесс в фоновом потоке."""
         last_progress_update = 0
         raw_output_lines = []
@@ -185,6 +204,8 @@ class TaskManager:
             # Determine final status
             return_code = proc.returncode
             full_output = '\n'.join(raw_output_lines)
+            if output_parser is not None:
+                full_output = output_parser(full_output)
             
             if return_code == 0:
                 task.update(

@@ -31,13 +31,13 @@ function TaskItem({ task, onCancel }: TaskItemProps) {
       }}
     >
       {task.status === "completed" && (
-        <CheckCircle size={16} color="#22c55e" />
+        <CheckCircle size={16} color="var(--jarvis-success)" />
       )}
       {task.status === "failed" && (
         <AlertCircle size={16} color="#ef4444" />
       )}
       {(task.status === "running" || task.status === "pending") && (
-        <Download size={16} color="#00D9FF" />
+        <Download size={16} color="var(--jarvis-accent)" />
       )}
 
       <div style={{ flex: 1, minWidth: 0 }}>
@@ -67,7 +67,7 @@ function TaskItem({ task, onCancel }: TaskItemProps) {
                 style={{
                   height: "100%",
                   width: `${task.progress || 0}%`,
-                  background: "linear-gradient(90deg, #00D9FF, #00ff88)",
+                  background: "linear-gradient(90deg, var(--jarvis-accent), var(--jarvis-success))",
                   borderRadius: "2px",
                   transition: "width 0.5s ease",
                 }}
@@ -319,7 +319,7 @@ export default function TaskNotification({ onClose }: TaskNotificationProps) {
           <div
             style={{
               height: "100%",
-              background: "linear-gradient(90deg, #00D9FF, #00ff88)",
+              background: "linear-gradient(90deg, var(--jarvis-accent), var(--jarvis-success))",
               transition: "width 0.5s ease",
               width: `${activeTasks[0]?.progress || 0}%`,
             }}

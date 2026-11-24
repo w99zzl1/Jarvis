@@ -1,22 +1,38 @@
-"""Plan store for Code Agent - manages task plans."""
-from typing import Dict, Any, List, Optional
+"""Per-agent plan store for the code agent.
+
+A plan belongs to one conversation/agent instance. The store used to be a
+process-wide singleton with a mutable "current" key: two code agents created in
+the same process could see and overwrite each other's task list, and callers
+had to remember to call ``set_current`` before every use. Now each agent owns
+its own ``PlanStore`` instance and the key is fixed when the store is injected.
+
+There is deliberately no global instance and no ``get_plan_store()``: sharing
+state implicitly is what caused the cross-conversation leak in the first place.
+"""
+from typing import Any, Dict, List, Optional
 
 
 class PlanStore:
-    _instance = None
-    _steps: List[Dict[str, Any]] = []
+    """Holds one or more named plans. Inject one instance per agent."""
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+    def __init__(self) -> None:
+        self._plans: Dict[str, List[Dict[str, Any]]] = {}
 
-    def update(self, steps: List[Dict[str, Any]], explanation: str = None) -> Dict[str, Any]:
+    @staticmethod
+    def _key(key: Optional[str]) -> str:
+        return key or "default"
+
+    def _steps(self, key: Optional[str] = None) -> List[Dict[str, Any]]:
+        return self._plans.setdefault(self._key(key), [])
+
+    def update(
+        self,
+        steps: List[Dict[str, Any]],
+        explanation: str = None,
+        key: Optional[str] = None,
+    ) -> Dict[str, Any]:
         if not isinstance(steps, list) or not steps:
-            return {
-                "success": False,
-                "error": "Plan must contain at least one step.",
-            }
+            return {"success": False, "error": "Plan must contain at least one step."}
         valid_statuses = {"pending", "in_progress", "completed"}
         in_progress_count = 0
         pending_indexes = []
@@ -50,22 +66,28 @@ class PlanStore:
             steps = [dict(s) for s in steps]
             steps[pending_indexes[0]]["status"] = "in_progress"
 
-        self._steps = steps
-        return {
-            "success": True,
-            "steps": self._steps,
-            "explanation": explanation,
-        }
+        self._plans[self._key(key)] = steps
+        return {"success": True, "steps": steps, "explanation": explanation}
 
-    def get_plan(self) -> List[Dict[str, Any]]:
-        return self._steps
+    def get_plan(self, key: Optional[str] = None) -> List[Dict[str, Any]]:
+        return list(self._steps(key))
 
-    def clear(self):
-        self._steps = []
+    def clear(self, key: Optional[str] = None) -> None:
+        self._plans[self._key(key)] = []
 
-
-_plan_store = PlanStore()
-
-
-def get_plan_store() -> PlanStore:
-    return _plan_store
+    def describe_current(self, key: Optional[str] = None) -> str:
+        """Compact plan state for the model's live system reminder."""
+        steps = self.get_plan(key)
+        if not steps:
+            return ""
+        lines = ["[System reminder — current task plan]"]
+        for step in steps:
+            mark = {
+                "completed": "x",
+                "in_progress": "~",
+                "pending": " ",
+            }.get(str(step.get("status")), " ")
+            lines.append(f"  [{mark}] {step.get('text', '')}")
+        lines.append("Keep working until every step is completed; update the plan as you go.")
+        lines.append("Do not end the turn with a promise — finish the action in this reply.")
+        return "\n".join(lines)

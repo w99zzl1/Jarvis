@@ -2,6 +2,7 @@ import json
 import logging
 import platform
 import re
+import time
 import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -9,20 +10,46 @@ from typing import Any
 
 logger = logging.getLogger("history")
 
+# A tool result is never shrunk below this many characters when the prompt has
+# to be squeezed into a provider's token window: shorter than this and the
+# output stops being actionable, so a hard trim of whole events is preferable.
+_MIN_TOOL_RESULT_CHARS = 1200
+
 
 def _runtime_context() -> str:
     """Ambient facts the model must never spend a tool call on."""
     now = datetime.now().astimezone()
     offset = now.strftime("%z")
     tz = f"UTC{offset[:3]}:{offset[3:]}" if offset else "local"
-    return (
-        "[Runtime context — trust this, do NOT call tools for it]\n"
-        f"Current local date and time: {now.strftime('%Y-%m-%d %H:%M:%S')} "
-        f"({now.strftime('%A')}, {tz})\n"
-        f"Platform: {platform.system()} {platform.release()}\n"
+    lines = [
+        "[Runtime context — trust this, do NOT call tools for it]",
+        # Minute precision is enough for the model and keeps the prompt prefix
+        # byte-stable between tool round-trips (prefix caching).
+        f"Current local date and time: {now.strftime('%Y-%m-%d %H:%M')} "
+        f"({now.strftime('%A')}, {tz})",
+        f"Platform: {platform.system()} {platform.release()}",
         "Time, date and platform are provided here. Use them directly instead of "
-        "running shell commands to discover them."
-    )
+        "running shell commands to discover them.",
+    ]
+
+    # The workspace is a hint, not a constraint: it tells the agent where the
+    # user's project usually lives so phrases like "find the bug" have a
+    # starting point. It must never be described as an access restriction.
+    try:
+        from shared.paths import workspace_dir
+
+        workspace = workspace_dir()
+    except Exception:
+        workspace = None
+    if workspace:
+        lines.append(
+            f"User's current workspace: {workspace}\n"
+            "This is a hint for where the project usually is, not an access "
+            "restriction — you may read, write and search anywhere the task "
+            "requires, using absolute paths when unsure."
+        )
+
+    return "\n".join(lines)
 
 
 # "I'm from Russia", "I live in Finland", "я из России", "нахожусь в Германии"
@@ -186,6 +213,13 @@ class ContextBuilder:
         self._sources = sources or []
         self._max_tokens = max_tokens
         self._max_history = max_history
+        # Ambient text is rebuilt once per (user turn, minute) instead of on
+        # every model call. A timestamp with second precision changed the very
+        # first bytes of the prompt each iteration, which defeats prefix
+        # caching on every provider that supports it (and cost a location
+        # lookup per tool round-trip).
+        self._ambient_key: tuple | None = None
+        self._ambient_parts: list[str] = []
 
     def estimate_tokens(self, messages: list[dict]) -> int:
         total = 4 * len(messages)
@@ -208,7 +242,13 @@ class ContextBuilder:
                 total += len(func.get("arguments", "")) // 3
         return total
 
-    def build(self, query_for_retrieval: str = "", provider: str | None = None, aggressive: bool = False) -> list[dict]:
+    def build(self, query_for_retrieval: str = "", provider: str | None = None, aggressive: bool = False,
+              token_budget: int | None = None) -> list[dict]:
+        # `token_budget` overrides the configured ceiling for this call. The
+        # agent lowers it after a provider rejects the request as too large
+        # (e.g. Groq free tier: 8k tokens/minute) — the window is a hard limit
+        # that our own generous `max_context_tokens` knows nothing about.
+        budget = token_budget if token_budget else self._max_tokens
         messages = []
         # The newest user message is what we check for a self-reported country.
         latest_user = ""
@@ -218,25 +258,32 @@ class ContextBuilder:
                 if isinstance(content, str):
                     latest_user = content
                 break
-        system_parts = [self._system_prompt, _runtime_context()]
-        loc = _location_context(latest_user or query_for_retrieval)
-        if loc:
-            system_parts.append(loc)
+        # Prefix stability: rebuild ambient facts only when the user turn or
+        # the minute changes. A per-second timestamp used to alter the system
+        # prompt on every single model call, so no provider could cache the
+        # (large, identical) prefix.
+        ambient_key = (latest_user or query_for_retrieval, int(time.time() // 60))
+        if ambient_key != self._ambient_key:
+            parts = [_runtime_context()]
+            loc = _location_context(latest_user or query_for_retrieval)
+            if loc:
+                parts.append(loc)
+            # Ambient knowledge, not a tool result: the paths the last disk
+            # scan knows about, as a fact. Costs ~60 tokens and saves the model
+            # a re-scan (or a wrong guess) when the user says "delete that folder".
+            try:
+                from shared.scan_cache import LAST_SCAN_REGISTRY
+                hint = LAST_SCAN_REGISTRY.describe()
+                if hint:
+                    parts.append(hint)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("[history] scan cache hint unavailable: %s", e)
+            for src in self._sources:
+                parts.append(f"[{src.describe()}]")
+            self._ambient_parts = parts
+            self._ambient_key = ambient_key
 
-        # Ambient knowledge, not a tool result: the paths the last disk scan
-        # knows about, as a fact. Costs ~60 tokens and saves the model a
-        # re-scan (or a wrong guess) when the user says "delete that folder".
-        try:
-            from shared.scan_cache import LAST_SCAN_REGISTRY
-            hint = LAST_SCAN_REGISTRY.describe()
-            if hint:
-                system_parts.append(hint)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("[history] scan cache hint unavailable: %s", e)
-
-        for src in self._sources:
-            system_parts.append(f"[{src.describe()}]")
-
+        system_parts = [self._system_prompt] + list(self._ambient_parts)
         if query_for_retrieval and self._sources:
             retrieved = []
             for src in self._sources:
@@ -249,60 +296,81 @@ class ContextBuilder:
                 system_parts.append("\n".join(ctx_lines))
 
         system_entry = {"role": "system", "content": "\n\n".join(system_parts)}
-        messages.append(system_entry)
+
+        def render(events: list[dict]) -> list[dict]:
+            last_user = self._last_user_index(events)
+            out = [system_entry]
+            for idx, event in enumerate(events):
+                clean = self._sanitize_for_llm(event, provider)
+                is_tool = event.get("role") == "tool"
+                # Aggressive mode (enabled only after repeated rate-limit hits):
+                # collapse every tool result, not just those older than the last
+                # user turn. Less aggressive by default to keep full context.
+                if is_tool and (aggressive or idx < last_user):
+                    clean["content"] = self._collapse_tool_result(event)
+                out.append(clean)
+            return out
 
         events = self._log.events
-        # Keep ALL events - no forced truncation (max_history is just a soft limit)
-        # Events are kept in full; only very end trimming if absolutely needed
-        # Commented out forced truncation to allow unlimited context:
-        # if len(events) > self._max_history:
-        #     events = events[-self._max_history:]
-
-        last_user = self._last_user_index(events)
-        collapsed = 0
-        for idx, event in enumerate(events):
-            clean = self._sanitize_for_llm(event, provider)
-            is_tool = event.get("role") == "tool"
-            # Aggressive mode (enabled only after repeated rate-limit hits):
-            # collapse every tool result, not just those older than the last
-            # user turn. Less aggressive by default to keep full context.
-            if is_tool and (aggressive or idx < last_user):
-                # Older than the current turn: the model is not reasoning about
-                # this output any more, so replay the digest instead of the
-                # payload. A full disk report is ~2k tokens and used to be resent
-                # in every request for the rest of the session.
-                shrunk = self._collapse_tool_result(event)
-                if shrunk != clean.get("content"):
-                    clean["content"] = shrunk
-                    collapsed += 1
-            messages.append(clean)
-
+        messages = render(events)
         used = self.estimate_tokens(messages)
-        logger.info(f"[CONTEXT] Built {len(messages)} msgs, ~{used}tok ({used/self._max_tokens*100:.0f}% of {self._max_tokens})")
-        if collapsed:
-            logger.info(f"[CONTEXT] {collapsed} older tool result(s) sent as summary")
+        logger.info(f"[CONTEXT] Built {len(messages)} msgs, ~{used}tok ({used/budget*100:.0f}% of {budget})")
 
-        # Hard trim: if we still exceed max_tokens, drop oldest non-system,
-        # non-current-turn events until we fit or run out of things to drop.
-        while used > self._max_tokens and len(messages) > 2:
-            # Never drop the system message (index 0) or the most recent
-            # user turn (find the last user event).
-            drop_idx = None
+        # Compaction runs BEFORE any character-level truncation. Crude cutting
+        # used to slice through a previous task mid-thought and erase what the
+        # agent had already decided; folding whole old turns into a durable
+        # system summary keeps that memory instead.
+        if used > budget:
+            summary, compacted = self._compact_prefix(events)
+            if summary:
+                dropped = len(events) - len(compacted)
+                system_entry["content"] += "\n\n" + summary
+                events = compacted
+                messages = render(events)
+                used = self.estimate_tokens(messages)
+                logger.info(
+                    "[CONTEXT] Compacted %d old event(s) into system summary: ~%dtok",
+                    dropped, used,
+                )
+
+        # Over budget: shrink the tool results first. Truncating keeps the
+        # transcript valid (every tool_call still has its tool message) and
+        # preserves the head of each result, which is where the model's useful
+        # data normally is. Dropping whole events — the older behaviour — could
+        # orphan a tool_call and get the history rejected.
+        if used > budget:
+            used = self._truncate_tool_results(messages, budget)
+            logger.info(f"[CONTEXT] Truncated tool output to fit budget: ~{used}tok / {budget}")
+
+        # Hard trim: if truncating tool output was not enough, drop whole old
+        # units until we fit or run out of things to drop. A unit is an
+        # assistant message together with the tool results that answer it:
+        # dropping the assistant alone would leave tool messages with no
+        # preceding tool_calls, which providers reject as malformed history.
+        while used > budget and len(messages) > 2:
+            # Never drop the system message (index 0) or a user message.
+            drop_start = None
             for i in range(1, len(messages) - 1):
                 if messages[i].get("role") != "user":
-                    drop_idx = i
+                    drop_start = i
                     break
-            if drop_idx is None:
+            if drop_start is None:
                 break
-            removed = messages.pop(drop_idx)
-            removed_text = removed.get("content", "")
+            drop_end = drop_start + 1
+            while drop_end < len(messages) and messages[drop_end].get("role") == "tool":
+                drop_end += 1
+            removed = messages[drop_start:drop_end]
+            del messages[drop_start:drop_end]
+            removed_chars = sum(
+                len(m.get("content") or "") for m in removed if isinstance(m.get("content"), str)
+            )
             used = self.estimate_tokens(messages)
             logger.info(
-                f"[CONTEXT] Trimmed old event ({removed.get('role')}, "
-                f"{len(removed_text)} chars) to fit context window"
+                f"[CONTEXT] Trimmed {len(removed)} old event(s) "
+                f"({removed_chars} chars) to fit context window"
             )
 
-        logger.info(f"[CONTEXT] Final {len(messages)} msgs, ~{used}tok ({used/self._max_tokens*100:.0f}% of {self._max_tokens})")
+        logger.info(f"[CONTEXT] Final {len(messages)} msgs, ~{used}tok ({used/budget*100:.0f}% of {budget})")
         return messages
 
     @staticmethod
@@ -346,6 +414,75 @@ class ContextBuilder:
                 f"{content[:4000]}"
             )
         return content
+
+    def _truncate_tool_results(self, messages: list[dict], budget: int) -> int:
+        """Shrink the largest tool results in place until the prompt fits.
+
+        Runs whenever the assembled prompt exceeds the effective budget — our
+        own soft ceiling, or the tighter one the agent supplies after a provider
+        rejects the request as too large. Returns the new estimated token count.
+        Truncating keeps the transcript valid and preserves the head of each
+        result, which is where the model's useful data normally is.
+        """
+        used = self.estimate_tokens(messages)
+        if used <= budget:
+            return used
+        # Candidates: tool results big enough to be worth trimming. `orig` keeps
+        # the full text so each pass rebuilds from it; `keepn` is how much of it
+        # currently survives. Cutting from the original (not from the already
+        # suffixed text) is what makes the loop terminate at the floor.
+        cand = [
+            i for i, m in enumerate(messages)
+            if m.get("role") == "tool"
+            and isinstance(m.get("content"), str)
+            and len(m["content"]) > _MIN_TOOL_RESULT_CHARS
+        ]
+        orig = {i: messages[i]["content"] for i in cand}
+        keepn = {i: len(orig[i]) for i in cand}
+
+        while used > budget and cand:
+            i = max(cand, key=lambda j: keepn[j])
+            overage = used - budget
+            room = keepn[i] - _MIN_TOOL_RESULT_CHARS
+            if room <= 0:
+                cand.remove(i)
+                continue
+            # Cut at least half (so the loop converges even if the estimate is
+            # off) but never below the floor, and never more than needed.
+            cut = min(room, max(overage * 3, keepn[i] // 2))
+            keepn[i] -= cut
+            dropped = len(orig[i]) - keepn[i]
+            messages[i]["content"] = orig[i][:keepn[i]] + (
+                f"\n[... truncated {dropped:,} of {len(orig[i]):,} characters to "
+                "fit the model's token budget; re-run the tool for the full "
+                "output ...]"
+            )
+            if keepn[i] <= _MIN_TOOL_RESULT_CHARS:
+                cand.remove(i)
+            used = self.estimate_tokens(messages)
+        return used
+
+    def _compact_prefix(self, events: list[dict], keep_turns: int = 2) -> tuple[str | None, list[dict]]:
+        """Fold the oldest completed turns into a summary for the system prompt.
+
+        Returns ``(summary, remaining_events)``. The cut is placed on a user
+        message boundary so an assistant `tool_calls` block is never separated
+        from the tool results that answer it — that would make the replayed
+        transcript invalid for OpenAI-compatible providers.
+        """
+        last_user = self._last_user_index(events)
+        if last_user <= 0:
+            return None, events
+        user_idxs = [
+            i for i, e in enumerate(events[:last_user]) if e.get("role") == "user"
+        ]
+        if len(user_idxs) <= keep_turns:
+            return None, events
+        cut = user_idxs[-keep_turns]
+        summary_event = self._compact_old_events(events[:cut])
+        if not summary_event:
+            return None, events
+        return summary_event["content"], events[cut:]
 
     def _compact_old_events(self, old: list[dict]) -> dict | None:
         """Compact old events beyond the recent window.

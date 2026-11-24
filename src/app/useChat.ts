@@ -5,6 +5,7 @@ import {
   sendMainChatStreaming,
   setConfig,
   getConfig,
+  DEFAULT_TTS_CONFIG,
   fetchCodeTools,
   fetchConversations,
   fetchConversation,
@@ -32,6 +33,18 @@ export interface ActivityEntry {
   progress?: ToolProgress;
   /** Backend id of the tool call, when it sent one. */
   callId?: string;
+  /** The exact command that was run (shell tools). */
+  command?: string;
+  /** Tool output / stdout (shell tools). */
+  output?: string;
+  /** Backend tool id (e.g. `read_file`), kept so the UI can pick an icon. */
+  tool?: string;
+  /**
+   * Agent iteration this entry belongs to. Text is streamed per iteration, so
+   * this is what lets the chat interleave `text → tools → text → tools…`
+   * in the order the agent actually worked.
+   */
+  iteration?: number;
 }
 
 export type ToolProgressPhase = "pending" | "live" | "done";
@@ -103,11 +116,15 @@ export interface Message {
   text: string;
   parts?: string[];
   activity?: ActivityEntry[];
+  /** How a user message was entered, so the log can label VOICE vs TEXT. */
+  source?: "voice" | "text";
   createdAt: number;
   /** total round-trip in ms, filled when the reply lands */
   latencyMs?: number;
   /** Attachments (images/files) attached to this message */
   attachments?: FileAttachment[];
+  /** Backend/network failure, rendered separately (red) from the reply text. */
+  error?: string;
 }
 
 const TOOL_LABELS: Record<string, string> = {
@@ -180,6 +197,7 @@ function eventsToMessages(events: ConversationEvent[]): Message[] {
   const now = Date.now();
   let n = 0;
   for (const e of events) {
+    if (e.internal) continue;
     const role = e.role;
     if (role !== "user" && role !== "assistant") continue;
     const text = contentToText(e.content).trim();
@@ -195,7 +213,23 @@ const EMPTY_CONFIG: AppConfig = {
   selected_primary: null,
   selected_model: {},
   disabled_tools: [],
+  tts: DEFAULT_TTS_CONFIG,
 };
+
+export interface RateLimitState {
+  /** Current provider that hit the limit */
+  provider: string;
+  /** Fallback provider being tried */
+  fallback_provider?: string;
+  /** Phase: "waiting" | "fallback" | "exhausted" | null */
+  phase: "waiting" | "fallback" | "exhausted" | null;
+  /** Seconds remaining to wait */
+  wait_seconds: number;
+  /** Human-readable message */
+  message: string;
+  /** Whether user has cancelled the wait */
+  cancelled: boolean;
+}
 
 export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "code" = "main") {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -211,6 +245,15 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
   const [history, setHistory] = useState<ConversationSummary[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [conversationId, setConversationIdState] = useState<string | null>(null);
+  /** Rate limit state for UI display */
+  const [rateLimitState, setRateLimitState] = useState<RateLimitState>({
+    provider: "",
+    fallback_provider: undefined,
+    phase: null,
+    wait_seconds: 0,
+    message: "",
+    cancelled: false,
+  });
 
   const idRef = useRef(0);
   const taskEventsRef = useRef<TaskStreamEvent[]>([]);
@@ -220,6 +263,8 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
   const abortRef = useRef<AbortController | null>(null);
   /** Message that is currently streaming, so Stop can mark it immediately. */
   const liveIdRef = useRef<number | null>(null);
+  /** Rate limit wait interval for countdown */
+  const rateLimitIntervalRef = useRef<number | null>(null);
 
   const loadConfig = useCallback(() => {
     getConfig()
@@ -231,11 +276,14 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
             selected_primary: cfg.selected_primary ?? prev.selected_primary,
             selected_model: cfg.selected_model || prev.selected_model,
             disabled_tools: cfg.disabled_tools || prev.disabled_tools,
+            tts: cfg.tts || prev.tts,
           }));
         }
       })
       .finally(() => setConfigLoaded(true));
-    fetchCodeTools().then(setTools).catch(() => {});
+    fetchCodeTools()
+      .then(setTools)
+      .catch((e) => console.error("[useChat] Failed to fetch code tools:", e));
   }, []);
 
   const updateApiKey = useCallback(async (provider: string, key: string) => {
@@ -334,6 +382,13 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
   }, []);
 
   const stop = useCallback(() => {
+    // Cancel any rate limit wait
+    if (rateLimitIntervalRef.current) {
+      clearInterval(rateLimitIntervalRef.current);
+      rateLimitIntervalRef.current = null;
+    }
+    setRateLimitState((prev) => ({ ...prev, cancelled: true, phase: null, wait_seconds: 0 }));
+
     const cid = conversationIdRef.current;
     const controller = abortRef.current;
     abortRef.current = null;
@@ -360,7 +415,12 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
   }, []);
 
   const send = useCallback(
-    async (raw?: string, attachments?: FileAttachment[]) => {
+    async (
+      raw?: string,
+      attachments?: FileAttachment[],
+      source: "voice" | "text" = "text",
+      synthesizeSpeech: boolean = source === "voice",
+    ) => {
       const text = (raw ?? input).trim();
       if (!text && (!attachments || attachments.length === 0)) return;
       if (loading) return;
@@ -374,6 +434,10 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
       // visibly alive before the backend says anything. It stops on its own the
       // moment a real sample arrives.
       let pendingTick: number | null = null;
+
+      /** Latest iteration seen on a `stream` event; tool entries are tagged with
+       *  it so the chat can interleave text and tools in the order they ran. */
+      let currentIter = 0;
 
       const appendActivity = (
         msgId: number,
@@ -397,6 +461,7 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
         id: idRef.current++,
         role: "user",
         text,
+        source,
         createdAt: Date.now(),
         ...(attachments && attachments.length > 0 ? { attachments } : {}),
       };
@@ -445,8 +510,69 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
           config.selected_primary || null,
           config.api_keys,
           (ev: StreamEvent) => {
+            if (ev.type === "handshake") {
+              // Handle schema version handshake
+              console.log(`[useChat] Handshake: schema v${ev.event_schema_version}`);
+              return;
+            }
+
+            if (ev.type === "rate_limit") {
+              const rlEv = ev as any;
+              setRateLimitState({
+                provider: rlEv.provider || "unknown",
+                fallback_provider: rlEv.fallback_provider,
+                phase: rlEv.phase,
+                wait_seconds: rlEv.wait_seconds || 0,
+                message: rlEv.message || "Rate limited...",
+                cancelled: false,
+              });
+
+              // Start countdown if waiting
+              if (rlEv.phase === "waiting" && rlEv.wait_seconds) {
+                let remaining = rlEv.wait_seconds;
+                rateLimitIntervalRef.current = setInterval(() => {
+                  remaining -= 1;
+                  setRateLimitState((prev) => {
+                    if (prev.cancelled || remaining <= 0) {
+                      if (rateLimitIntervalRef.current) {
+                        clearInterval(rateLimitIntervalRef.current);
+                        rateLimitIntervalRef.current = null;
+                      }
+                      return { ...prev, phase: null, wait_seconds: 0 };
+                    }
+                    return { ...prev, wait_seconds: remaining };
+                  });
+                }, 1000);
+              }
+
+              // If fallback, show notification
+              if (rlEv.phase === "fallback" && rlEv.fallback_provider) {
+                appendActivity(liveId, (a) => [
+                  ...a,
+                  {
+                    id: a.length ? a[a.length - 1].id + 1 : 1,
+                    kind: "say",
+                    text: `⚠️ Rate limit hit on ${rlEv.provider}, trying fallback: ${rlEv.fallback_provider}`,
+                    status: "done",
+                    iteration: currentIter,
+                  },
+                ]);
+              }
+
+              // If exhausted
+              if (rlEv.phase === "exhausted") {
+                setRateLimitState((prev) => ({ ...prev, phase: null, wait_seconds: 0 }));
+                if (rateLimitIntervalRef.current) {
+                  clearInterval(rateLimitIntervalRef.current);
+                  rateLimitIntervalRef.current = null;
+                }
+              }
+              return;
+            }
+
             if (ev.type === "stream") {
               const it = (ev as any).iteration ?? 0;
+              currentIter = it;
               setMessages((prev) =>
                 prev.map((m) => {
                   if (m.id !== liveId) return m;
@@ -481,6 +607,7 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
                   kind: "say",
                   text: say,
                   status: "done",
+                  iteration: currentIter,
                 },
               ]);
               return;
@@ -489,7 +616,8 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
             if (ev.type === "tool_started") {
               const toolName = (ev as any).tool || (ev as any).tool_name;
               const callId = (ev as any).call_id;
-              const label = describeTool(toolName, (ev as any).args);
+              const args = (ev as any).args || {};
+              const label = describeTool(toolName, args);
               appendActivity(liveId, (a) => {
                 const id = a.length ? a[a.length - 1].id + 1 : 1;
                 toolStartTimes.set(id, performance.now());
@@ -504,8 +632,40 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
                     // seconds away, and an empty bar reads as a hang.
                     progress: pendingProgress(toolName),
                     callId,
+                    tool: toolName,
+                    iteration: currentIter,
+                    command: toolName === "run_powershell" || toolName === "run_cmd" || toolName === "shell" ? args.command : undefined,
                   },
                 ];
+              });
+              return;
+            }
+
+            if (ev.type === "tool_output") {
+              const callId = (ev as any).call_id;
+              const output = (ev as any).output || "";
+              appendActivity(liveId, (a) => {
+                let realIdx = -1;
+                if (callId) {
+                  const byId = a.findIndex(
+                    (e) => e.kind === "tool" && e.status === "running" && e.callId === callId,
+                  );
+                  if (byId !== -1) realIdx = byId;
+                }
+                if (realIdx === -1) {
+                  const idx = [...a]
+                    .reverse()
+                    .findIndex((e) => e.kind === "tool" && e.status === "running");
+                  if (idx === -1) return a;
+                  realIdx = a.length - 1 - idx;
+                }
+                const next = [...a];
+                const prevOutput = next[realIdx].output || "";
+                next[realIdx] = {
+                  ...next[realIdx],
+                  output: prevOutput + output,
+                };
+                return next;
               });
               return;
             }
@@ -557,6 +717,17 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
               const failed =
                 (ev as any).status && (ev as any).status !== "success";
               const serverMs = (ev as any).duration;
+              const result = (ev as any).result || {};
+              const data = result.data || {};
+              // Shell results carry stdout/stderr; older tools returned
+              // data.output. Join both streams so a warning on stderr is not
+              // lost just because the command itself exited successfully.
+              const shellOutput = [data.stdout, data.stderr]
+                .filter((part: unknown) => typeof part === "string" && part.trim())
+                .join("\n")
+                .trim();
+              const output: string | undefined =
+                shellOutput || data.output || result.output || result.text || undefined;
               appendActivity(liveId, (a) => {
                 const idx = [...a]
                   .reverse()
@@ -570,6 +741,9 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
                       text: label,
                       status: failed ? "failed" : "done",
                       duration: serverMs,
+                      output,
+                      tool: (ev as any).tool || (ev as any).tool_name,
+                      iteration: currentIter,
                     },
                   ];
                 }
@@ -583,6 +757,12 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
                   progress: undefined,
                   duration:
                     serverMs ?? (started ? performance.now() - started : undefined),
+                  // Never erase already-streamed output with `undefined`:
+                  // cancelled/timed-out commands may send no final result.
+                  output:
+                    next[realIdx].command && output !== undefined
+                      ? output
+                      : next[realIdx].output,
                 };
                 return next;
               });
@@ -597,6 +777,7 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
                   kind: "tool",
                   text: (ev as any).error || (ev as any).message || "ошибка",
                   status: "failed",
+                  iteration: currentIter,
                 },
               ]);
               return;
@@ -605,6 +786,7 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
           {
             conversation_id: conversationId,
             disabled_tools: config.disabled_tools,
+            synthesize_speech: agentType === "main" && synthesizeSpeech,
             ...(attachments && attachments.length > 0
               ? { attachments: attachments.map((a) => ({ path: a.path, name: a.name, mime: a.mime, size: a.size })) }
               : {}),
@@ -618,9 +800,8 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
           storeConversationId(agentType, finalEvent.conversation_id);
         }
 
-        const reply = finalEvent.error
-          ? `Ошибка: ${finalEvent.error}`
-          : finalEvent.reply || "(нет ответа)";
+        const reply = finalEvent.reply || "";
+        const error = finalEvent.error || undefined;
 
         setMessages((prev) =>
           prev.map((m) => {
@@ -629,17 +810,18 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
               m.parts && m.parts.length ? [...m.parts] : m.text ? [m.text] : [];
             const last = parts.length ? parts[parts.length - 1] : "";
             const already = last && reply && last.trim() === reply.trim();
-            if (!already) parts.push(reply);
+            if (reply && !already) parts.push(reply);
             return {
               ...m,
               parts,
               text: parts.join("\n\n"),
               latencyMs: performance.now() - startedAt,
+              ...(error ? { error } : {}),
             };
           }),
         );
 
-        if (finalEvent.audio) {
+        if (finalEvent.audio && agentType === "main" && synthesizeSpeech) {
           onSpeaking?.(true);
           try {
             await playAudioFromBase64(finalEvent.audio);
@@ -651,12 +833,7 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
           setMessages((prev) =>
             prev.map((m) =>
               m.id === liveId
-                ? {
-                    ...m,
-                    text: m.text
-                      ? m.text + "\n\nОшибка: " + (e?.message || e)
-                      : "Ошибка: " + (e?.message || e),
-                  }
+                ? { ...m, error: String(e?.message || e) }
                 : m,
             ),
           );
@@ -692,7 +869,11 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
     setToolEnabled,
     restoreAllTools,
     send,
-    sendWithAttachments: (atts: FileAttachment[]) => send(undefined, atts),
+    sendWithAttachments: (
+      atts: FileAttachment[],
+      source: "voice" | "text" = "text",
+      synthesizeSpeech: boolean = source === "voice",
+    ) => send(undefined, atts, source, synthesizeSpeech),
     stop,
     reset,
     history,
@@ -701,5 +882,7 @@ export function useChat(onSpeaking?: (v: boolean) => void, agentType: "main" | "
     loadConversation,
     removeConversation,
     conversationId: conversationIdRef.current,
+    rateLimitState,
+    rateLimitIntervalRef,
   };
 }

@@ -10,9 +10,11 @@ if os.name == 'nt':
     kernel32 = ctypes.windll.kernel32
 
     JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    # Killing on handle close is the whole point: Stop closes the handle and
+    # every descendant dies. Breakaway flags were removed because they let a
+    # shell's children (python, node, test runners) escape the job, so Timeout
+    # and Stop left orphan processes holding the stdout pipe.
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-    JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
-    JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000
 
     class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
         _fields_ = [
@@ -60,15 +62,6 @@ else:
 
 _lock = threading.RLock()
 _jobs = {}
-_local = threading.local()
-
-
-def set_current_cid(cid):
-    _local.cid = cid
-
-
-def get_current_cid():
-    return getattr(_local, 'cid', None)
 
 
 def _create_job():
@@ -78,7 +71,7 @@ def _create_job():
     if not h:
         return None
     info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
     if not kernel32.SetInformationJobObject(h, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info), ctypes.sizeof(info)):
         kernel32.CloseHandle(h)
         return None

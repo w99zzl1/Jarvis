@@ -1,0 +1,353 @@
+/* ==========================================================
+   PER-WINDOW COLOR THEMES
+   `aether` is our current chat/voice palette (values below are the existing
+   ones, kept verbatim). `onyx` is the dark emerald palette from the mockup.
+   Only colors, backgrounds, borders and shadows change here — geometry,
+   typography, animations and control layout are untouched.
+   ========================================================== */
+
+:root {
+  --jarvis-opacity: 0.72;
+  --jarvis-panel-rgb: 1, 4, 8;
+  --jarvis-chat-bg: #0a0c10;
+  --jarvis-scrollbar: #232733;
+  --jarvis-scrollbar-hover: #333a4d;
+  --jarvis-accent: #00d9ff;
+  --jarvis-accent-2: #8b5cff;
+  --jarvis-hud: #00f0ff;
+  --jarvis-hud-rgb: 0, 240, 255;
+  --jarvis-success: #00d97e;
+  --jarvis-core-glow-rgb: 81, 219, 255;
+  --jarvis-core-glow-2-rgb: 0, 130, 255;
+  --jarvis-voice-mic: #34d399;
+  --jarvis-voice-stop: #b4555b;
+  --jarvis-voice-muted: rgba(255, 255, 255, 0.5);
+  --jarvis-settings-accent: #10b981;
+  --jarvis-settings-soft: #34d399;
+  --jarvis-settings-cyan: #22d3ee;
+}
+
+html[data-theme="onyx"] {
+  color-scheme: dark;
+
+  --jarvis-panel-rgb: 1, 4, 8;
+  --jarvis-chat-bg: #0c0d11;
+  --jarvis-scrollbar: #20232a;
+  --jarvis-scrollbar-hover: #2e333d;
+  --jarvis-accent: #10b981;
+  --jarvis-accent-2: #34d399;
+  --jarvis-hud: #10b981;
+  --jarvis-hud-rgb: 16, 185, 129;
+  --jarvis-success: #10b981;
+  --jarvis-core-glow-rgb: 16, 185, 129;
+  --jarvis-core-glow-2-rgb: 52, 211, 153;
+  --jarvis-voice-mic: #34d399;
+  --jarvis-voice-stop: #fbbf24;
+  --jarvis-voice-muted: #8f96a3;
+  /* Settings are deliberately inverted: Onyx uses the plain settings skin. */
+  --jarvis-settings-accent: #10b981;
+  --jarvis-settings-soft: #34d399;
+  --jarvis-settings-cyan: #22d3ee;
+
+  /* shadcn / Radix tokens */
+  --background: #0c0d11;
+  --foreground: #c9cdd5;
+  --card: #101217;
+  --card-foreground: #c9cdd5;
+  --popover: #101217;
+  --popover-foreground: #c9cdd5;
+  --primary: #34d399;
+  --primary-foreground: #04150e;
+  --secondary: #a7f3d0;
+  --secondary-foreground: #04150e;
+  --muted: #1e232e;
+  --muted-foreground: #8f96a3;
+  --accent: #10b981;
+  --accent-foreground: #04150e;
+  --destructive: #fb7185;
+  --destructive-foreground: #2a0708;
+  --border: #20232a;
+  --input: #1e232e;
+  --input-background: #0c0d11;
+  --switch-background: #2e333d;
+  --ring: rgba(16, 185, 129, 0.35);
+  --sidebar: #0c0d11;
+  --sidebar-foreground: #c9cdd5;
+  --sidebar-primary: #34d399;
+  --sidebar-primary-foreground: #04150e;
+  --sidebar-accent: #1e232e;
+  --sidebar-accent-foreground: #c9cdd5;
+  --sidebar-border: #20232a;
+  --sidebar-ring: #10b981;
+
+  /* Material 3 / draft tokens used by the assistant and its dialogs */
+  --color-surface-container-lowest: #0c0d11;
+  --color-surface-container-low: #0e1014;
+  --color-surface-container: #14161b;
+  --color-surface-container-high: #1e232e;
+  --color-surface-container-highest: #262a34;
+  --color-surface-bright: #2e333d;
+  --color-surface-variant: #20232a;
+  --color-surface-dim: #0c0d11;
+  --color-surface-tint: #10b981;
+  --color-on-surface: #c9cdd5;
+  --color-on-surface-variant: #8f96a3;
+  --color-on-background: #c9cdd5;
+  --color-outline: #6e7585;
+  --color-outline-variant: #20232a;
+  --color-inverse-surface: #e1e4ea;
+  --color-inverse-on-surface: #0c0d11;
+  --color-primary-container: #34d399;
+  --color-primary-fixed: #a7f3d0;
+  --color-primary-fixed-dim: #34d399;
+  --color-on-primary-container: #04150e;
+  --color-on-primary-fixed: #04150e;
+  --color-on-primary-fixed-variant: #04150e;
+  --color-inverse-primary: #10b981;
+  --color-secondary-fixed: #a7f3d0;
+  --color-secondary-fixed-dim: #34d399;
+  --color-secondary-container: #064e3b;
+  --color-on-secondary-container: #a7f3d0;
+  --color-on-secondary-fixed: #04150e;
+  --color-on-secondary-fixed-variant: #a7f3d0;
+  --color-tertiary: #ecfdf5;
+  --color-tertiary-container: #a7f3d0;
+  --color-tertiary-fixed: #a7f3d0;
+  --color-tertiary-fixed-dim: #34d399;
+  --color-on-tertiary: #04150e;
+  --color-on-tertiary-container: #04150e;
+  --color-on-tertiary-fixed: #04150e;
+  --color-on-tertiary-fixed-variant: #a7f3d0;
+}
+
+/* Settings window is the inverse of chat/voice: the Onyx-styled settings
+   belong to Aether, and the original settings skin belongs to Onyx. Only
+   settings-scoped variables are flipped here; chat/voice palettes above stay
+   exactly as they were. */
+html[data-theme="aether"] {
+  --jarvis-panel-rgb: 12, 13, 17;
+  --jarvis-settings-accent: #34d399;
+  --jarvis-settings-soft: #10b981;
+  --jarvis-settings-cyan: #10b981;
+}
+
+html[data-theme="onyx"] body {
+  background-color: #0c0d11;
+  color: #c9cdd5;
+}
+
+/* Arbitrary Tailwind color utilities are mapped explicitly so not a single
+   hardcoded hex from the current palette leaks into Onyx. */
+html[data-theme="onyx"] [class~="bg-[#08090D]"],
+html[data-theme="onyx"] [class~="bg-[#090A0C]"],
+html[data-theme="onyx"] [class~="bg-[#0C0D12]"] {
+  background-color: #0C0D11;
+}
+
+html[data-theme="onyx"] [class~="bg-[#0C0E14]"],
+html[data-theme="onyx"] [class~="bg-[#0D1017]"],
+html[data-theme="onyx"] [class~="bg-[#0E1013]"],
+html[data-theme="onyx"] [class~="bg-[#0E1017]"] {
+  background-color: #0E1014;
+}
+
+html[data-theme="onyx"] [class~="bg-[#10131B]"],
+html[data-theme="onyx"] [class~="bg-[#11141C]"],
+html[data-theme="onyx"] [class~="bg-[#12151D]"],
+html[data-theme="onyx"] [class~="bg-[#12151E]"] {
+  background-color: #111319;
+}
+
+html[data-theme="onyx"] [class~="bg-[#14161B]"],
+html[data-theme="onyx"] [class~="bg-[#141a1c]"],
+html[data-theme="onyx"] [class~="bg-[#151821]"] {
+  background-color: #14161B;
+}
+
+html[data-theme="onyx"] [class~="bg-[#161A23]"],
+html[data-theme="onyx"] [class~="bg-[#171A24]"],
+html[data-theme="onyx"] [class~="bg-[#1A1016]"] {
+  background-color: #16181F;
+}
+
+html[data-theme="onyx"] [class~="bg-[#1A1D26]"] {
+  background-color: #1A1D24;
+}
+
+html[data-theme="onyx"] [class~="bg-[#1A202C]"],
+html[data-theme="onyx"] [class~="bg-[#1B1E24]"] {
+  background-color: #1E232E;
+}
+
+html[data-theme="onyx"] [class~="bg-[#1E222D]"],
+html[data-theme="onyx"] [class~="bg-[#1E2332]"],
+html[data-theme="onyx"] [class~="bg-[#1c2527]"],
+html[data-theme="onyx"] [class~="bg-[#6E7480]"] {
+  background-color: #20232A;
+}
+
+html[data-theme="onyx"] [class~="bg-[#282D3B]"] {
+  background-color: #262A34;
+}
+
+html[data-theme="onyx"] [class~="bg-[#3A4150]"] {
+  background-color: #2E333D;
+}
+
+html[data-theme="onyx"] [class~="bg-[#ECEEF2]"] {
+  background-color: #DCE0E8;
+}
+
+html[data-theme="onyx"] [class~="border-[#181C26]"],
+html[data-theme="onyx"] [class~="border-[#1A1D26]"],
+html[data-theme="onyx"] [class~="border-[#1A1D27]"],
+html[data-theme="onyx"] [class~="border-[#1A1E29]"],
+html[data-theme="onyx"] [class~="border-[#1B1F2C]"],
+html[data-theme="onyx"] [class~="border-[#1D212D]"],
+html[data-theme="onyx"] [class~="border-[#1F232F]"],
+html[data-theme="onyx"] [class~="border-[#1e292b]"],
+html[data-theme="onyx"] [class~="border-[#202534]"],
+html[data-theme="onyx"] [class~="border-[#22252C]"],
+html[data-theme="onyx"] [class~="border-[#222736]"],
+html[data-theme="onyx"] [class~="border-[#232734]"] {
+  border-color: #20232A;
+}
+
+html[data-theme="onyx"] [class~="border-[#4A505E]"] {
+  border-color: #353B46;
+}
+
+html[data-theme="onyx"] [class~="text-[#07130D]"] {
+  color: #07130D;
+}
+
+html[data-theme="onyx"] [class~="text-[#090A0C]"] {
+  color: #0C0D11;
+}
+
+html[data-theme="onyx"] [class~="text-[#22252C]"] {
+  color: #20232A;
+}
+
+html[data-theme="onyx"] [class~="text-[#555B66]"] {
+  color: #6E7585;
+}
+
+html[data-theme="onyx"] [class~="text-[#6E7480]"],
+html[data-theme="onyx"] [class~="text-[#8A8F98]"] {
+  color: #8F96A3;
+}
+
+html[data-theme="onyx"] [class~="text-[#94A3B8]"] {
+  color: #A0A6B2;
+}
+
+html[data-theme="onyx"] [class~="text-[#CBD5E1]"] {
+  color: #B8BEC9;
+}
+
+html[data-theme="onyx"] [class~="text-[#E2E8F0]"] {
+  color: #C9CDD5;
+}
+
+html[data-theme="onyx"] [class~="text-[#ECEEF2]"] {
+  color: #DCE0E8;
+}
+
+html[data-theme="onyx"] [class~="text-[#F1F5F9]"] {
+  color: #E1E4EA;
+}
+
+html[data-theme="onyx"] [class~="text-[#F8FAFC]"] {
+  color: #E6E9EF;
+}
+
+html[data-theme="onyx"] [class~="placeholder-[#555B66]"]::placeholder {
+  color: #6E7585;
+}
+
+html[data-theme="onyx"] [class~="placeholder-[#94A3B8]"]::placeholder {
+  color: #747B8C;
+}
+
+/* Named utilities that still carry the current cyan/purple accent. */
+html[data-theme="onyx"] [class~="text-white"] { color: #E1E4EA; }
+html[data-theme="onyx"] [class~="bg-white"] { background-color: #DCE0E8; }
+html[data-theme="onyx"] [class~="border-white"] { border-color: #20232A; }
+html[data-theme="onyx"] [class~="border-white/[0.08]"],
+html[data-theme="onyx"] [class~="border-white/[0.1]"] { border-color: rgba(32, 35, 42, 0.9); }
+html[data-theme="onyx"] [class~="bg-white/[0.04]"] { background-color: rgba(32, 35, 42, 0.45); }
+html[data-theme="onyx"] [class~="bg-black/20"] { background-color: rgba(6, 8, 11, 0.6); }
+html[data-theme="onyx"] [class~="text-blue-200"],
+html[data-theme="onyx"] [class~="text-purple-400"] { color: #6EE7B7; }
+html[data-theme="onyx"] [class~="bg-blue-500/10"],
+html[data-theme="onyx"] [class~="bg-purple-500/10"] { background-color: rgba(16, 185, 129, 0.12); }
+html[data-theme="onyx"] [class~="border-blue-400/50"],
+html[data-theme="onyx"] [class~="border-purple-500/20"],
+html[data-theme="onyx"] [class~="border-purple-500/40"] { border-color: rgba(16, 185, 129, 0.35); }
+
+/* Main voice/chat window details that live in an injected component <style>. */
+html[data-theme="onyx"] #coreStageTop {
+  border-bottom-color: #20232A;
+  background-image: linear-gradient(to bottom, #0E1014 0%, #0C0D11 50%, #0A0B0E 100%);
+}
+html[data-theme="onyx"] .voice-action-btn {
+  background-color: #14161B;
+  border-color: #20232A;
+  color: #C9CDD5;
+}
+html[data-theme="onyx"] .voice-action-btn:hover {
+  background-color: #1E232E;
+  border-color: #2E333D;
+  color: #E1E4EA;
+}
+
+/* Settings window. Component CSS is injected at runtime, so these selectors
+   are intentionally more specific; inline values use the variables above. */
+html[data-theme="aether"] .set-root { color: #C9CDD5; }
+html[data-theme="aether"] .set-card {
+  background-color: rgba(12, 13, 17, 0.94);
+  border-color: #20232A;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(32, 35, 42, 0.9);
+}
+html[data-theme="aether"] .set-titlebar { border-bottom-color: #1C1F26; background-color: #0E1014; }
+html[data-theme="aether"] .set-brand-name { color: #DCE0E8; }
+html[data-theme="aether"] .set-brand-sep { color: #555C6C; }
+html[data-theme="aether"] .set-brand-settings { color: #A0A6B2; }
+html[data-theme="aether"] .set-titlebar-right { color: #6E7585; }
+html[data-theme="aether"] .set-version { color: #A0A6B2; background-color: #16181F; border-color: #20232A; }
+html[data-theme="aether"] .set-win-btn { color: #6E7585; }
+html[data-theme="aether"] .set-win-btn:hover { color: #DCE0E8; background-color: #20232A; }
+html[data-theme="aether"] .set-tabs { border-bottom-color: #20232A; background-color: #0C0D11; }
+html[data-theme="aether"] .set-tabs-inner { border-color: #20232A; background-color: #0E1014; }
+html[data-theme="aether"] .set-tab { color: #8F96A3; }
+html[data-theme="aether"] .set-tab:hover { color: #DCE0E8; background-color: #14161B; }
+html[data-theme="aether"] .set-tab.active { color: #E1E4EA; background-color: #20232A; }
+html[data-theme="aether"] .set-group-head h3 { color: #8F96A3; }
+html[data-theme="aether"] .set-group-head span { color: #555C6C; }
+html[data-theme="aether"] .set-group-head span.online { color: #34D399; }
+html[data-theme="aether"] .set-group-body { border-color: #20232A; background-color: #0E1014; }
+html[data-theme="aether"] .set-group-body > * + * { border-top-color: #20232A; }
+html[data-theme="aether"] .set-row:hover { background-color: #111319; }
+html[data-theme="aether"] .set-row-title { color: #DCE0E8; }
+html[data-theme="aether"] .set-row-hint { color: #8F96A3; }
+html[data-theme="aether"] .set-row-label { color: #A0A6B2; }
+html[data-theme="aether"] .set-toggle-track { background-color: #20232A; border-color: #2E333D; }
+html[data-theme="aether"] .set-toggle-thumb { background-color: #8F96A3; }
+html[data-theme="aether"] .set-toggle-track.is-on { background-color: #10B981; border-color: #059669; }
+html[data-theme="aether"] .set-toggle-track.is-on .set-toggle-thumb { background-color: #E1E4EA; }
+html[data-theme="aether"] .set-select { color: #C9CDD5; background-color: #14161B; border-color: #20232A; }
+html[data-theme="aether"] .set-select:hover { background-color: #1E232E; }
+html[data-theme="aether"] .set-select-caret { color: #6E7585; }
+html[data-theme="aether"] .set-slider-head { color: #8F96A3; }
+html[data-theme="aether"] .set-slider { background-color: #20232A; accent-color: #10B981; }
+html[data-theme="aether"] .set-slider::-webkit-slider-thumb { background-color: #34D399; box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.15); }
+html[data-theme="aether"] .set-slider::-moz-range-thumb { background-color: #34D399; box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.15); }
+html[data-theme="aether"] .set-kbd-row { color: #8F96A3; }
+html[data-theme="aether"] .set-kbd { color: #C9CDD5; background-color: #14161B; border-color: #20232A; }
+html[data-theme="aether"] .set-footer { border-top-color: #20232A; background-color: #0C0D11; }
+html[data-theme="aether"] .set-daemon { color: #6E7585; }
+html[data-theme="aether"] .set-btn-reset { color: #8F96A3; }
+html[data-theme="aether"] .set-btn-reset:hover { color: #DCE0E8; background-color: #14161B; }
+html[data-theme="aether"] .set-btn-save { color: #04150E; background-color: #34D399; box-shadow: 0 0 12px rgba(16, 185, 129, 0.3); }
+html[data-theme="aether"] .set-btn-save:hover { background-color: #6EE7B7; }

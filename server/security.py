@@ -16,13 +16,21 @@ boundary, because CORS does not stop non-browser clients.
 ``/health`` stays open: the Rust watchdog polls it before the UI exists, and it
 only reports liveness. ``/docs`` stays open too: it exposes no data, and calling
 anything still needs the token.
+
+Token Rotation:
+- Tokens have a TTL (default 24 hours) to limit exposure if leaked
+- The Tauri shell stores token hash + expiry and rotates on startup if expired
+- `/auth/rotate` endpoint allows explicit rotation (requires current token)
 """
 
 from __future__ import annotations
 
 import hmac
+import hashlib
 import logging
 import os
+import time
+from pathlib import Path
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -31,6 +39,7 @@ log = logging.getLogger("security")
 
 TOKEN_ENV = "JARVIS_API_TOKEN"
 TOKEN_HEADER = "x-jarvis-token"
+TOKEN_TTL_SECONDS = 24 * 60 * 60  # 24 hours
 
 # Paths served without a token (see the module docstring).
 PUBLIC_PATHS = {
@@ -39,21 +48,91 @@ PUBLIC_PATHS = {
     "/redoc",
     "/openapi.json",
     "/docs/oauth2-redirect",
+    "/auth/rotate",  # Allow token rotation endpoint
 }
 
 # Tauri serves the frontend from http://tauri.localhost on Windows and from
 # https://tauri.localhost elsewhere; Vite dev server runs on 5173.
+# Note: tauri://localhost is non-standard; use tauri://* pattern for broader compatibility
 ALLOWED_ORIGINS = [
     "http://tauri.localhost",
     "https://tauri.localhost",
-    "tauri://localhost",
+    "tauri://*",  # Matches all tauri:// origins (more compatible than localhost)
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 ]
 
 
+def _token_file() -> Path:
+    """Path to token hash + expiry file."""
+    from shared.paths import app_dir
+    return app_dir() / "api_token.json"
+
+
+def _token_hash(token: str) -> str:
+    """Hash token for storage (not plaintext)."""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _load_token_info() -> dict:
+    """Load stored token hash and expiry."""
+    path = _token_file()
+    if not path.is_file():
+        return {}
+    try:
+        import json
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_token_info(token: str, expiry: float) -> None:
+    """Save token hash and expiry atomically."""
+    path = _token_file()
+    import json
+    data = {"hash": _token_hash(token), "expiry": expiry}
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    tmp.replace(path)
+
+
 def expected_token() -> str:
     return os.environ.get(TOKEN_ENV, "").strip()
+
+
+def is_token_expired() -> bool:
+    """Check if current token is expired based on stored expiry."""
+    info = _load_token_info()
+    expiry = info.get("expiry")
+    if not expiry:
+        return False  # No expiry info = don't enforce
+    return time.time() > expiry
+
+
+def rotate_token(new_token: str | None = None) -> tuple[str, float]:
+    """Generate and store a new token with expiry.
+
+    Returns:
+        Tuple of (token, expiry_timestamp)
+    """
+    import secrets
+    if new_token is None:
+        new_token = secrets.token_urlsafe(32)
+    expiry = time.time() + TOKEN_TTL_SECONDS
+    _save_token_info(new_token, expiry)
+    # Update env var for current process
+    os.environ[TOKEN_ENV] = new_token
+    log.info("[security] Token rotated, expires in %d seconds", TOKEN_TTL_SECONDS)
+    return new_token, expiry
+
+
+def validate_token_rotation(current_token: str) -> bool:
+    """Validate current token matches stored hash (for rotation endpoint)."""
+    info = _load_token_info()
+    stored_hash = info.get("hash")
+    if not stored_hash:
+        return False  # No stored token = can't validate
+    return hmac.compare_digest(_token_hash(current_token), stored_hash)
 
 
 def _supplied_token(request: Request) -> str:

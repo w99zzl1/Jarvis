@@ -1,7 +1,7 @@
 import time
 import logging
 
-from .registry import Tool, ToolResult, VerificationStatus
+from .registry import Tool, ToolResult
 
 log = logging.getLogger("web_search")
 
@@ -144,11 +144,3 @@ class WebSearchTool(Tool):
             return []
 
     # ----- Verification -----
-
-    def verify(self, args: dict, result: ToolResult) -> VerificationStatus:
-        if result.status != "success":
-            return VerificationStatus.FAILED
-        results = result.data.get("results") if isinstance(result.data, dict) else None
-        if not results:
-            return VerificationStatus.UNKNOWN
-        return VerificationStatus.SUCCESS

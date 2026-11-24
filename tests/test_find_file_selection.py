@@ -6,7 +6,7 @@ Deterministic checks (no LLM):
 
 Live checks (real model, repeated):
   - ask the code agent to find SamFwToolSetup.exe
-  - if it calls shell/run_powershell/run_cmd, ABORT the agent immediately and
+  - if it calls shell/run_powershell, ABORT the agent immediately and
     fail the run
   - success only when find_file is called and returns the exact path
 
@@ -29,7 +29,7 @@ if ROOT not in sys.path:
 
 TARGET = "SamFwToolSetup.exe"
 PROMPT = "Найди файл SamFwToolSetup.exe"
-SHELL_TOOLS = {"shell", "run_powershell", "run_cmd"}
+SHELL_TOOLS = {"shell", "run_powershell"}
 
 
 class ShellAbort(BaseException):
@@ -209,46 +209,51 @@ def _build_main_agent(model=None, provider=None):
 
 
 def _run_main_live_once(prompt, model=None, provider=None):
+    # The engine now creates an AttemptExecutor per retry, so patching an
+    # `agent._execute_tool` attribute (which no longer exists) observed nothing.
+    # Patch the single execution boundary instead; this is the same seam for
+    # every attempt and every tool the model calls.
+    from agents.main.tool_executor import ToolExecutor
+    from agents.main.tools.registry import ToolResult
+
     agent = _build_main_agent(model=model, provider=provider)
 
     calls = []
     shell_calls = []
+    original_execute = ToolExecutor.execute_tool
 
-    original_execute = agent._execute_tool
-
-    def guarded_execute(name, args, call_id):
+    def guarded_execute(self, name, args, call_id, *rest, **kwargs):
         calls.append((name, args))
         if name in SHELL_TOOLS:
             shell_calls.append((name, args))
-            raise ShellAbort(f"agent chose {name} instead of purpose-built tool: {args}")
-        return original_execute(name, args, call_id)
+            return ToolResult(
+                status="error",
+                error=f"test blocked shell tool {name}: {args}",
+            )
+        return original_execute(self, name, args, call_id, *rest, **kwargs)
 
-    agent._execute_tool = guarded_execute
+    ToolExecutor.execute_tool = guarded_execute
 
     run_result = None
     started = time.time()
     try:
         run_result = agent.run(prompt)
-    except ShellAbort as e:
-        return {
-            "calls": [name for name, _ in calls],
-            "shell_calls": shell_calls,
-            "aborted": str(e),
-            "output": None,
-            "state": "aborted",
-            "success": False,
-            "error": str(e),
-            "elapsed": round(time.time() - started, 2),
-        }
+    finally:
+        ToolExecutor.execute_tool = original_execute
 
+    aborted = (
+        f"agent chose {name} instead of purpose-built tool: {args}"
+        for name, args in shell_calls
+    )
+    abort_message = next(aborted, None)
     return {
         "calls": [name for name, _ in calls],
         "shell_calls": shell_calls,
-        "aborted": None,
+        "aborted": abort_message,
         "output": getattr(run_result, "output", None),
-        "state": getattr(run_result, "state", None),
-        "success": getattr(run_result, "success", False),
-        "error": getattr(run_result, "error", None),
+        "state": "aborted" if abort_message else getattr(run_result, "state", None),
+        "success": False if abort_message else getattr(run_result, "success", False),
+        "error": abort_message or getattr(run_result, "error", None),
         "elapsed": round(time.time() - started, 2),
     }
 

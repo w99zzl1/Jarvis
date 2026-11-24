@@ -3,6 +3,7 @@ node_modules/
 dist/
 .vite/
 src-tauri/target/
+src-tauri/target_*/
 src-tauri/gen/schemas/
 native/**/target/
 

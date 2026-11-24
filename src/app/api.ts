@@ -30,9 +30,100 @@ async function withToken(
   return { ...headers, "X-Jarvis-Token": await getApiToken() };
 }
 
+// ---------------------------------------------------------------------------
+// Backend readiness
+// ---------------------------------------------------------------------------
+// The Python child needs a moment to bind port 8765. Calling the API before
+// that only produces ERR_CONNECTION_REFUSED noise in devtools on every start.
+// Every HTTP request waits here first; the shell reports the real failure if
+// the backend could not start at all.
+
+const READY_POLL_MS = 250;
+// The Rust watchdog gives the backend 60s before reporting failure; wait a
+// little longer so we surface its message instead of our own timeout.
+const READY_TIMEOUT_MS = 65_000;
+
+let backendReadyPromise: Promise<void> | null = null;
+
+async function waitForBackend(): Promise<void> {
+  if (!backendReadyPromise) {
+    backendReadyPromise = (async () => {
+      const deadline = Date.now() + READY_TIMEOUT_MS;
+      while (Date.now() <= deadline) {
+        let status: BackendStatus | null = null;
+        let shellAvailable = false;
+        try {
+          status = await invoke<BackendStatus>("backend_status");
+          shellAvailable = true;
+        } catch {
+          // Not running inside Tauri (plain browser dev): probe /health below.
+          shellAvailable = false;
+        }
+        if (status?.ready) return;
+        if (status?.failed) {
+          throw new Error(status.message || "Jarvis backend failed to start");
+        }
+        if (!shellAvailable) {
+          try {
+            // /health is deliberately token-free, so this works before the
+            // token is available too.
+            const res = await fetch(`${API_BASE}/health`);
+            if (res.ok) return;
+          } catch {
+            // Backend is still starting up.
+          }
+        }
+        await new Promise((r) => setTimeout(r, READY_POLL_MS));
+      }
+      throw new Error("Jarvis backend did not start in time");
+    })().catch((err) => {
+      // Let the next request retry instead of caching a transient failure.
+      backendReadyPromise = null;
+      throw err;
+    });
+  }
+  return backendReadyPromise;
+}
+
 // ============================================================================
 // Типы: AppConfig (хранится в Tauri: провайдеры → ключи, выбранная primary)
 // ============================================================================
+
+/** Silero is the only TTS engine; the saved config still records it explicitly. */
+export interface TTSConfig {
+  provider: "silero";
+  enabled: boolean;
+  model_id: string;
+  speaker: string;
+  language: string;
+  sample_rate: number;
+  device: string;
+}
+
+export const DEFAULT_TTS_CONFIG: TTSConfig = {
+  provider: "silero",
+  enabled: true,
+  model_id: "v4_ru",
+  speaker: "aidar",
+  language: "ru",
+  sample_rate: 48000,
+  device: "cpu",
+};
+
+export function normalizeTTSConfig(raw: any): TTSConfig {
+  const src = raw && typeof raw === "object" ? raw : {};
+  return {
+    provider: "silero",
+    enabled: typeof src.enabled === "boolean" ? src.enabled : DEFAULT_TTS_CONFIG.enabled,
+    model_id: typeof src.model_id === "string" ? src.model_id : DEFAULT_TTS_CONFIG.model_id,
+    speaker: typeof src.speaker === "string" ? src.speaker : DEFAULT_TTS_CONFIG.speaker,
+    language: typeof src.language === "string" ? src.language : DEFAULT_TTS_CONFIG.language,
+    sample_rate: Number.isFinite(src.sample_rate)
+      ? Number(src.sample_rate)
+      : DEFAULT_TTS_CONFIG.sample_rate,
+    device: typeof src.device === "string" ? src.device : DEFAULT_TTS_CONFIG.device,
+  };
+}
 
 /** Конфиг, совместимый с Rust AppConfig: api_keys — HashMap<String, String>, selected_model тоже обязательно */
 export interface AppConfig {
@@ -41,6 +132,8 @@ export interface AppConfig {
   selected_model: Record<string, string>;
   /** Code-agent tools the user switched off in the side dock. */
   disabled_tools: string[];
+  /** Local Silero voice used only by main-agent voice mode. */
+  tts: TTSConfig;
 }
 
 export async function getConfig(): Promise<AppConfig> {
@@ -92,6 +185,7 @@ export function normalizeConfig(raw: any): AppConfig {
     selected_primary,
     selected_model: raw.selected_model || {},
     disabled_tools,
+    tts: normalizeTTSConfig(raw.tts),
   };
 }
 
@@ -106,6 +200,10 @@ export interface ModelSpec {
 
 export interface ChatRequestPayload {
   message: string;
+  /** Explicit agent choice. The backend never overrides it from message text. */
+  agent_type?: "main" | "code";
+  /** Explicit UI signal to speak the main-agent reply with Silero TTS. */
+  synthesize_speech?: boolean;
   /** Stable id so the backend can keep this conversation's history across turns. */
   conversation_id?: string;
   primary_spec?: ModelSpec;
@@ -256,6 +354,24 @@ export interface StreamExecutionInfoEvent {
   message?: string;
   error?: string;
 }
+export interface StreamRateLimitEvent {
+  type: "rate_limit";
+  /** "waiting" | "fallback" | "exhausted" */
+  phase: "waiting" | "fallback" | "exhausted";
+  /** Current provider that hit the limit */
+  provider: string;
+  /** Fallback provider being tried (if phase="fallback") */
+  fallback_provider?: string;
+  /** Seconds to wait before retry */
+  wait_seconds?: number;
+  /** Human-readable message */
+  message: string;
+}
+export interface StreamHandshakeEvent {
+  type: "handshake";
+  event_schema_version: number;
+  timestamp: number;
+}
 export type StreamEvent =
   | StreamProgressEvent
   | StreamThoughtEvent
@@ -267,6 +383,8 @@ export type StreamEvent =
   | StreamAgentMessageEvent
   | StreamStreamEvent
   | StreamExecutionInfoEvent
+  | StreamRateLimitEvent
+  | StreamHandshakeEvent
   | StreamFinalEvent;
 
 // ============================================================================
@@ -295,7 +413,7 @@ export async function sendVoiceChat(
 ): Promise<ChatResponse> {
   return apiFetch<ChatResponse>("/chat", {
     method: "POST",
-    body: buildBody(message, primary, apiKeys),
+    body: buildBody(message, primary, apiKeys, { agent_type: "main" }),
   });
 }
 
@@ -307,7 +425,7 @@ export async function sendCodeChat(
 ): Promise<ChatResponse> {
   return apiFetch<ChatResponse>("/code/chat", {
     method: "POST",
-    body: buildBody(message, primary, apiKeys),
+    body: buildBody(message, primary, apiKeys, { agent_type: "code" }),
   });
 }
 
@@ -322,6 +440,7 @@ export async function sendChatStreaming(
   extra: Partial<ChatRequestPayload> = {},
   signal?: AbortSignal,
 ): Promise<StreamFinalEvent> {
+  await waitForBackend();
   const res = await fetch(`${API_BASE}${endpoint}`, {
     method: "POST",
     headers: await withToken({
@@ -391,7 +510,7 @@ export async function sendCodeChatStreaming(
     primary,
     apiKeys,
     onEvent,
-    extra,
+    { ...extra, agent_type: "code" },
     signal,
   );
 }
@@ -411,7 +530,7 @@ export async function sendMainChatStreaming(
     primary,
     apiKeys,
     onEvent,
-    extra,
+    { ...extra, agent_type: "main" },
     signal,
   );
 }
@@ -430,6 +549,7 @@ export async function getBackendStatus(): Promise<BackendStatus> {
 }
 
 export async function transcribeAudio(file: File): Promise<{ text: string }> {
+  await waitForBackend();
   const form = new FormData();
   form.append("file", file);
   const res = await fetch(`${API_BASE}/stt/transcribe`, {
@@ -451,6 +571,7 @@ export function playAudioFromBase64(base64: string): Promise<void> {
 }
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  await waitForBackend();
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers: await withToken({
@@ -475,6 +596,7 @@ export async function uploadFiles(
   for (const f of fileArray) {
     form.append("files", f);
   }
+  await waitForBackend();
   const res = await fetch(`${API_BASE}/upload`, {
     method: "POST",
     headers: await withToken(),
@@ -518,6 +640,7 @@ export interface TaskEvent {
 
 export async function fetchLiveModels(apiKeys?: Record<string, string>): Promise<Record<string, string[]>> {
   try {
+    await waitForBackend();
     const res = await fetch(`${API_BASE}/models/fetch`, {
       method: "POST",
       headers: await withToken({ "Content-Type": "application/json" }),
@@ -541,17 +664,26 @@ export interface CodeToolInfo {
 }
 
 /** GET /code/tools — full code-agent tool catalog for the side-dock toggles. */
-export async function fetchCodeTools(): Promise<CodeToolInfo[]> {
-  try {
-    const res = await fetch(`${API_BASE}/code/tools`, {
-      headers: await withToken(),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      return (data.tools || []) as CodeToolInfo[];
+export async function fetchCodeTools(retries = 3): Promise<CodeToolInfo[]> {
+  await waitForBackend();
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const res = await fetch(`${API_BASE}/code/tools`, {
+        headers: await withToken(),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        return (data.tools || []) as CodeToolInfo[];
+      }
+      if (res.status === 401) {
+        // Token might be stale, invalidate and retry once
+        apiTokenPromise = null;
+        continue;
+      }
+    } catch (e) {
+      console.error(`[fetchCodeTools] attempt ${attempt + 1}/${retries} failed:`, e);
     }
-  } catch (e) {
-    console.error("Failed to fetch code tools", e);
+    if (attempt < retries - 1) await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
   }
   return [];
 }
@@ -577,6 +709,7 @@ export interface ConversationEvent {
 /** GET /conversations — newest-first chat-history summaries. */
 export async function fetchConversations(): Promise<ConversationSummary[]> {
   try {
+    await waitForBackend();
     const res = await fetch(`${API_BASE}/conversations`, {
       headers: await withToken(),
     });
@@ -593,6 +726,7 @@ export async function fetchConversations(): Promise<ConversationSummary[]> {
 /** GET /conversations/{id} — raw event log so the UI can replay it. */
 export async function fetchConversation(id: string): Promise<ConversationEvent[]> {
   try {
+    await waitForBackend();
     const res = await fetch(`${API_BASE}/conversations/${encodeURIComponent(id)}`, {
       headers: await withToken(),
     });
@@ -608,6 +742,7 @@ export async function fetchConversation(id: string): Promise<ConversationEvent[]
 
 export async function deleteConversation(id: string): Promise<boolean> {
   try {
+    await waitForBackend();
     const res = await fetch(`${API_BASE}/conversations/${encodeURIComponent(id)}`, {
       method: "DELETE",
       headers: await withToken(),
@@ -632,6 +767,7 @@ export async function cancelTask(taskId: string): Promise<void> {
 }
 
 export async function stopAgent(conversationId: string) {
+  await waitForBackend();
   const res = await fetch(`${API_BASE}/agent/stop`, {
     method: "POST",
     headers: await withToken({ "Content-Type": "application/json" }),
@@ -639,6 +775,21 @@ export async function stopAgent(conversationId: string) {
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
+}
+
+// ============================================================================
+// Streaming speech-to-text transport
+// ============================================================================
+
+/**
+ * URL for the STT WebSocket. The token is passed in the query because the
+ * WebSocket API cannot set headers; the endpoint validates it on upgrade.
+ */
+export async function sttStreamUrl(sessionId: string): Promise<string> {
+  await waitForBackend();
+  const token = await getApiToken();
+  const query = `session_id=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(token)}`;
+  return `${API_BASE.replace(/^http/, "ws")}/stt/stream?${query}`;
 }
 
 export function subscribeTaskEvents(
@@ -649,7 +800,9 @@ export function subscribeTaskEvents(
   let stopped = false;
 
   getApiToken()
-    .then((token) => {
+    .then(async (token) => {
+      if (stopped) return;
+      await waitForBackend();
       if (stopped) return;
       source = new EventSource(
         `${API_BASE}/tasks/events?token=${encodeURIComponent(token)}`,

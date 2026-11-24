@@ -60,8 +60,9 @@ your data.
 
 1. Open the settings window and paste an API key for a provider.
 2. Pick a primary model.
-3. Choose a workspace folder — the folder the agent's file and shell tools are
-   allowed to work in. Default: `Documents\Jarvis`.
+3. Optionally choose a workspace folder — a hint that tells the agent where
+   your project usually lives. There is no default; the agent can read and
+   write anywhere the task requires.
 
 ---
 
@@ -83,9 +84,10 @@ Everything writable lives in one per-user folder:
   backend.log            Python backend log (first place to look on errors)
 ```
 
-The installation folder itself is treated as read-only. Your **workspace**
-(the folder the agent may edit) is separate and defaults to `Documents\Jarvis`.
-Both locations can be overridden with the `JARVIS_DATA_DIR` and
+The installation folder itself is treated as read-only. Your **workspace** is
+an optional hint for where "the project" is: it has no default and never
+restricts the agent, whose file and shell tools may work anywhere the task
+requires. Both locations can be overridden with the `JARVIS_DATA_DIR` and
 `JARVIS_WORKDIR` environment variables.
 
 ---

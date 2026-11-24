@@ -16,7 +16,7 @@ interface ModelSelectorProps {
   onPrimaryChange: (spec: { provider: ProviderId; model: string }) => void;
   apiKeys: Record<string, string>;
   onApiKeyChange: (provider: string, key: string) => void;
-  /** Dashboard renders its own trigger in the HUD strip — hide the built-in one. */
+  /** The owner renders its own trigger (HUD pill / modal) — hide the built-in one. */
   hideTrigger?: boolean;
   /** Controlled open state (used together with hideTrigger). */
   forceOpen?: boolean;
@@ -25,7 +25,7 @@ interface ModelSelectorProps {
 }
 
 const PROVIDER_COLORS: Record<string, string> = {
-  Groq: "#00D9FF",
+  Groq: "var(--jarvis-accent)",
   Google: "#4285F4",
   OpenAI: "#10A37F",
   OpenRouter: "#A78BFA",

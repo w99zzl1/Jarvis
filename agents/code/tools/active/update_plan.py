@@ -1,6 +1,6 @@
 from typing import Dict, Any
 from ..base import Tool
-from ...plan_store import get_plan_store
+from ...plan_store import PlanStore
 
 
 class UpdatePlanTool(Tool):
@@ -39,8 +39,13 @@ class UpdatePlanTool(Tool):
         "required": ["steps"],
     }
 
-    def __init__(self, project_path: str = None):
-        pass
+    def __init__(self, project_path: str = None, plan_key: str = None,
+                 store: PlanStore | None = None):
+        # The store is injected by the factory so the tool and the engine share
+        # exactly one plan instance for this agent. A standalone instance gets
+        # its own private store; no process-wide state is involved.
+        self.plan_key = plan_key
+        self.store = store if store is not None else PlanStore()
 
     def execute(self, steps: list, explanation: str = None) -> Dict[str, Any]:
-        return get_plan_store().update(steps, explanation)
+        return self.store.update(steps, explanation, key=self.plan_key)

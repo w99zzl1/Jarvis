@@ -1,11 +1,11 @@
 import logging
 import os
 
-from .agent import Agent
+from .agent_refactored import Agent
 from shared.llm_client import LLMClient
 from shared.llm_client.api_key_manager import APIKeyManager
 from .tools.registry import ToolRegistry, GetToolsTool
-from .tools.shell import RunCmdTool, RunPowerShellTool
+from .tools.shell import RunPowerShellTool
 from .tools.clipboard import ClipboardTool
 from .tools.read import ReadTool
 from .tools.write import WriteTool
@@ -15,6 +15,7 @@ from .tools.monitor import MonitorTool
 from .tools.memory import MemoryTool
 from .tools.task_status import TaskStatusTool
 from .tools.search_files import SearchFilesTool
+from .tools.grep import GrepTool
 from agents.code.tools.active.disk_tree import DiskTreeTool
 
 import config.main as config_main
@@ -89,8 +90,8 @@ def _resolve_key_for_provider(
     fallback_env = {
         "groq": config_main.GROQ_API_KEY or config_main.LLM_API_KEY,
         "google": config_main.GOOGLE_API_KEY,
-        "nim": os.getenv("NIM_API_KEY"),
-        "openai": os.getenv("OPENAI_API_KEY"),
+        "nim": getattr(config_main, "NIM_API_KEY", None) or os.getenv("NIM_API_KEY"),
+        "openai": getattr(config_main, "OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY"),
         "openrouter": getattr(config_main, "OPENROUTER_API_KEY", None) or os.getenv("OPENROUTER_API_KEY"),
     }
     return fallback_env.get(provider)
@@ -201,7 +202,6 @@ def create_agent(
 
     registry.register(GetToolsTool(registry))
     registry.register(RunPowerShellTool())
-    registry.register(RunCmdTool())
     registry.register(ClipboardTool())
     registry.register(ReadTool())
     registry.register(WriteTool())
@@ -211,6 +211,7 @@ def create_agent(
     registry.register(MemoryTool())
     registry.register(TaskStatusTool())
     registry.register(SearchFilesTool())
+    registry.register(GrepTool(project_path=""))
     registry.register(DiskTreeTool())
 
     if not system_prompt:

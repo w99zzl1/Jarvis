@@ -64,7 +64,6 @@ class LLMClient:
 
         self.model: str = model
         self.provider: str = provider.strip().lower()
-        self._base_url: str | None = base_url
 
         self._provider_impl: BaseProvider = ProviderFactory.create(
             provider=self.provider,
@@ -84,11 +83,13 @@ class LLMClient:
         max_tokens=1024,
         temperature=0.1,
         frequency_penalty=0.3,
+        cancel=None,
     ):
         """
         Возвращает (content, tool_calls, finish_reason).
         Формат как и раньше, чтобы не переписывать весь agent.py.
         """
+        # Try primary provider first
         resp: ChatResponse = self._provider_impl.ask(
             model=self.model,
             messages=messages,
@@ -96,8 +97,24 @@ class LLMClient:
             max_tokens=max_tokens,
             temperature=temperature,
             frequency_penalty=frequency_penalty,
+            cancel=cancel,
         )
 
+        # Record request for rate limit tracking
+        try:
+            content = resp.content or ""
+            tool_calls_str = str(resp.tool_calls) if resp.tool_calls else ""
+            estimated_tokens = (len(content) + len(tool_calls_str)) // 4
+            if hasattr(self._provider_impl, 'record_request'):
+                self._provider_impl.record_request(self.provider, estimated_tokens)
+        except Exception:
+            pass
+
+        # A rate-limited response is returned to the agent's own rate limiter,
+        # which owns the conversation and can shrink/retry it. Cross-provider
+        # fallback was never wired (no fallback keys/models reach this client)
+        # and would also need a per-provider model id, so it was removed rather
+        # than left as dead API.
         # Случай 1: нативные tool_calls из SDK — возвращаем как есть, agent.py умеет с ними работать
         native = resp.tool_calls
         if native is not None:
@@ -129,6 +146,7 @@ class LLMClient:
         max_tokens=1024,
         temperature=0.1,
         frequency_penalty=0.3,
+        cancel=None,
     ):
         """
         Стриминговая версия ask().
@@ -143,6 +161,7 @@ class LLMClient:
             max_tokens=max_tokens,
             temperature=temperature,
             frequency_penalty=frequency_penalty,
+            cancel=cancel,
         )
         for kind, payload in gen:
             if kind == "delta":

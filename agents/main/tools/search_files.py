@@ -18,6 +18,7 @@ import os
 import time
 from typing import Dict, Any, List, Optional
 
+from shared.paths import resolve_path
 from .registry import Tool, ToolResult
 from shared import file_index
 
@@ -215,8 +216,11 @@ class SearchFilesTool(Tool):
 
         # Scoped search: the user named a concrete place, search exactly it.
         if path:
-            scope = os.path.abspath(path)
-            if not os.path.isdir(scope):
+            try:
+                scope = resolve_path(path)
+            except Exception as e:
+                return ToolResult(status="error", error=f"Invalid path: {e}")
+            if not scope.is_dir():
                 return ToolResult(status="error", error=f"Directory not found: {scope}")
             try:
                 res = self._search_scoped(

@@ -1,9 +1,9 @@
 import { useState, useCallback } from "react";
 import { Mic, MicOff } from "lucide-react";
 import { motion } from "motion/react";
-import { invoke } from "@tauri-apps/api/core";
+import { startAudioCapture, stopAudioCapture } from "../audioCapture";
 
-const CYAN = "#00D9FF";
+const CYAN = "var(--jarvis-accent)";
 const MONO = "'Space Mono', monospace";
 
 interface VoiceButtonProps {
@@ -25,12 +25,8 @@ export default function VoiceButton({
     if (isListening) {
       setLoading(true);
       try {
-        const result = await invoke<{ text: string }>("audio_record_stop");
-        if (result.text && result.text.trim()) {
-          onTranscript(result.text.trim());
-        } else {
-          console.warn("[Voice] STT returned empty text");
-        }
+        // Recognition is backend-owned; the final text arrives via onFinal.
+        await stopAudioCapture();
       } catch (e) {
         console.error("[Voice] Stop recording error:", e);
       } finally {
@@ -39,7 +35,17 @@ export default function VoiceButton({
       }
     } else {
       try {
-        await invoke("audio_record_start");
+        await startAudioCapture({
+          onFinal: (text) => {
+            const t = text.trim();
+            if (t) onTranscript(t);
+            setIsListening(false);
+          },
+          onError: (message) => {
+            console.error("[Voice] STT error:", message);
+            setIsListening(false);
+          },
+        });
         setIsListening(true);
       } catch (e) {
         console.error("[Voice] Start recording error:", e);

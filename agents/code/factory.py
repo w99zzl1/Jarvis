@@ -7,6 +7,7 @@ from agents.main.agent import Agent, AgentConfig
 from shared.llm_client import LLMClient
 from shared.llm_client.api_key_manager import APIKeyManager
 from agents.code.registry import CodeToolRegistry
+from agents.code.plan_store import PlanStore
 
 logger = logging.getLogger("code.factory")
 
@@ -177,8 +178,14 @@ def create_code_agent(
     event_sink=None,
     base_url: str | None = None,
     disabled_tools: list[str] | None = None,
+    plan_key: str | None = None,
 ) -> Agent:
     settings = config_code.Settings.from_env(project_path)
+    # A plan belongs to this agent instance only. Both the update_plan tool and
+    # the engine receive the same store, so no process-wide "current" key or
+    # mutable global is needed.
+    resolved_plan_key = plan_key or f"code:{settings.project_path}"
+    plan_store = PlanStore()
     all_keys = get_api_keys()
 
     # 1) Primary: явные аргументы → сохранённый выбор UI → settings.get_model()/settings.provider
@@ -210,25 +217,30 @@ def create_code_agent(
     )
 
     registry = CodeToolRegistry(
-        project_path=settings.project_path, disabled=disabled_tools
+        project_path=settings.project_path, disabled=disabled_tools,
+        plan_key=resolved_plan_key, plan_store=plan_store,
     )
     prompt = system_prompt or config_code.SYSTEM_PROMPT.format(
         project_path=settings.project_path,
         tool_directory=_build_tool_directory(registry),
     )
 
-    return Agent(
+    agent = Agent(
         registry=registry,
         primary_llm=primary_llm,
         system_prompt=prompt,
         config=AgentConfig(
-            max_iterations=80,
-            max_tool_calls=120,
+            # Matching the main agent: no small fixed budget that cuts a
+            # multi-file implementation short. The time guard still bounds it.
+            max_iterations=300,
+            max_tool_calls=600,
             max_execution_time=1200,
-            # Whole files must fit, but a large budget also reserves tokens
-            # against the provider's per-minute cap (Groq free tier: 8k TPM),
-            # so 2000 is the practical ceiling for ~150-line files.
-            max_output_tokens=2000,
+            # Whole files must fit, and a thinking model spends part of the
+            # budget on hidden reasoning before any visible text — so 2000 was
+            # too tight and truncated answers mid-sentence. This is only a
+            # ceiling: the provider clamps it to fit a smaller token window
+            # (Groq free tier is 8k TPM) before the request is sent.
+            max_output_tokens=8192,
             # A free tier allows 5 (Google) to 30 (Groq) requests per minute,
             # while one code task easily needs a dozen rounds. Wait out the
             # throttle instead of dropping the user's task halfway through.
@@ -236,4 +248,7 @@ def create_code_agent(
             rate_limit_wait=900.0,
         ),
         event_sink=event_sink,
+        plan_store=plan_store,
+        plan_key=resolved_plan_key,
     )
+    return agent

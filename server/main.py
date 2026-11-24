@@ -13,25 +13,40 @@ if _root not in sys.path:
 if _server_dir not in sys.path:
     sys.path.insert(0, _server_dir)
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request, WebSocket
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from routes.chat import chat_route, chat_stream
 from routes.agent import agent_route, agent_chat_stream
 from routes.code_agent import code_chat_route, code_chat_stream
-from routes.stt import transcribe_audio, stream_chunk, finalize
+from routes.stt import transcribe_audio, stt_stream
 from shared.llm_client.model_fetcher import check_connected_providers_and_fetch_models, fetch_provider_models
 from shared.config_loader import get_selected_models
-from shared import agent_job
 from shared import paths as _paths
 from security import install as install_security
+from security import rotate_token, validate_token_rotation
 
 log = logging.getLogger("server")
 
 app = FastAPI(title="Jarvis Agent API")
 
+# Strong reference to the startup warm-up task (see startup_event).
+_warmup_task: "asyncio.Task | None" = None
+
 @app.on_event("startup")
 async def startup_event():
+    # Bind the socket immediately. Model discovery and the whole-system file
+    # index can take many seconds (network + a full disk walk); doing them here
+    # made the UI hit ERR_CONNECTION_REFUSED on every launch because the port
+    # was not accepting yet. They now warm up in a worker thread.
+    global _warmup_task
+    # Hold a strong reference: the event loop only keeps weak references to
+    # tasks, so without this the warm-up could be collected mid-run.
+    _warmup_task = asyncio.create_task(asyncio.to_thread(_warm_up_backend))
+
+
+def _warm_up_backend() -> None:
     log.info("[SERVER] Checking connected providers and fetching supported models via official API...")
     try:
         models_map = check_connected_providers_and_fetch_models()
@@ -63,7 +78,7 @@ async def health():
         "status": "ok",
         "service": "jarvis-backend",
         "data_dir": str(_paths.app_dir()),
-        "workspace": str(_paths.workspace_dir()),
+        "workspace": str(_paths.workspace_dir() or ""),
     }
 
 
@@ -117,6 +132,49 @@ async def upload_files(files: List[UploadFile] = File(...)):
     """Save uploaded files to the uploads dir and return file info for the UI."""
     _ensure_upload_dir()
     MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
+
+    # MIME type whitelist - only allow safe file types
+    ALLOWED_MIME_TYPES = frozenset({
+        # Images
+        "image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp",
+        "image/tiff", "image/svg+xml", "image/x-icon", "image/heic", "image/heif",
+        # Text / Code
+        "text/plain", "text/markdown", "text/csv", "text/html", "text/css",
+        "text/javascript", "text/x-python", "text/x-script.python",
+        "application/json", "application/xml", "application/yaml",
+        "application/x-yaml", "application/toml",
+        # Documents
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        # Data
+        "application/csv", "application/sql", "application/x-sql",
+        # Archives (for inspection only - no execution)
+        "application/zip", "application/x-zip-compressed",
+        "application/gzip", "application/x-gzip",
+        "application/x-tar", "application/x-bzip2", "application/x-xz",
+    })
+
+    # Blocked extensions (executable files)
+    BLOCKED_EXTENSIONS = frozenset({
+        ".exe", ".msi", ".bat", ".cmd", ".ps1", ".psm1", ".psd1",
+        ".sh", ".bash", ".zsh", ".fish", ".csh", ".tcsh",
+        ".py", ".pyw", ".pyc", ".pyo", ".pyd",
+        ".js", ".mjs", ".cjs", ".ts", ".tsx",
+        ".jar", ".war", ".ear",
+        ".dll", ".so", ".dylib",
+        ".app", ".deb", ".rpm", ".apk", ".ipa",
+        ".scr", ".com", ".pif", ".application",
+        ".gadget", ".msc", ".jar", ".wsf", ".wsh",
+        ".ps1xml", ".psc1", ".psc2", ".msh", ".msh1", ".msh2",
+        ".mshxml", ".msh1xml", ".msh2xml",
+        ".reg", ".inf", ".ini", ".pol",
+    })
+
     saved = []
     for f in files:
         # Sanitize filename
@@ -124,6 +182,17 @@ async def upload_files(files: List[UploadFile] = File(...)):
         # Reject path traversal or absolute paths
         if "/" in safe_name or "\\" in safe_name or ".." in safe_name:
             raise ValueError(f"Unsafe filename: {f.filename}")
+
+        # Check file extension
+        _, ext = os.path.splitext(safe_name.lower())
+        if ext in BLOCKED_EXTENSIONS:
+            raise ValueError(f"File type not allowed: {ext}")
+
+        # Check MIME type
+        mime = f.content_type or "application/octet-stream"
+        if mime not in ALLOWED_MIME_TYPES:
+            raise ValueError(f"MIME type not allowed: {mime}")
+
         dest = os.path.join(_UPLOAD_DIR, safe_name)
         # Avoid collisions
         if os.path.exists(dest):
@@ -137,10 +206,147 @@ async def upload_files(files: List[UploadFile] = File(...)):
         saved.append({
             "path": os.path.abspath(dest),
             "name": f.filename,
-            "mime": f.content_type or "application/octet-stream",
+            "mime": mime,
             "size": len(content),
         })
     return {"success": True, "attachments": saved}
+
+
+# ============================================================================
+# Token Rotation
+# ============================================================================
+
+class RotateTokenRequest(BaseModel):
+    """Request to rotate the API token (requires current valid token)."""
+    pass  # Current token is validated via header
+
+
+@app.post("/auth/rotate")
+async def rotate_token_endpoint(request: Request):
+    """Rotate the API token. Requires valid current token in header.
+
+    Returns new token and expiry timestamp.
+    """
+    # Get current token from header
+    current_token = request.headers.get("x-jarvis-token", "").strip()
+    if not current_token:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Missing current token for rotation."},
+        )
+
+    # Validate current token matches stored hash
+    if not validate_token_rotation(current_token):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Invalid current token."},
+        )
+
+    # Generate new token
+    new_token, expiry = rotate_token()
+    return {
+        "success": True,
+        "token": new_token,
+        "expiry": expiry,
+        "ttl_seconds": 24 * 60 * 60,
+    }
+
+
+# ============================================================================
+# STT/TTS Settings
+# ============================================================================
+
+class STTConfigRequest(BaseModel):
+    """Request to update STT configuration."""
+    model: str | None = None  # tiny, base, small, medium, large
+    device: str | None = None  # cpu, cuda
+    compute_type: str | None = None  # int8, float16, float32
+
+
+class TTSConfigRequest(BaseModel):
+    """Request to update TTS configuration."""
+    provider: str | None = None  # silero (the only supported engine)
+    enabled: bool | None = None
+    model_id: str | None = None  # v4_ru, v3_en, etc.
+    speaker: str | None = None  # aidar, baya, kseniya, xenia, eugene, random
+    language: str | None = None  # ru, en
+    sample_rate: int | None = None  # 8000, 16000, 48000
+    device: str | None = None  # cpu, cuda
+
+
+@app.get("/settings/stt")
+async def get_stt_settings():
+    """Get current STT configuration."""
+    from shared.config_loader import get_stt_config
+    return {"success": True, "config": get_stt_config()}
+
+
+@app.post("/settings/stt")
+async def update_stt_settings(req: STTConfigRequest):
+    """Update STT configuration. Changes take effect on next transcription."""
+    from shared.config_loader import get_app_config, save_app_config
+    cfg = get_app_config()
+    stt = cfg.get("stt", {})
+    if not isinstance(stt, dict):
+        stt = {}
+    if req.model is not None:
+        stt["model"] = req.model
+    if req.device is not None:
+        stt["device"] = req.device
+    if req.compute_type is not None:
+        stt["compute_type"] = req.compute_type
+    cfg["stt"] = stt
+    save_app_config(cfg)
+    # Invalidate cached model to force reload with new config
+    try:
+        from server.routes.stt import _invalidate_stt_model
+        _invalidate_stt_model()
+    except Exception:
+        pass
+    return {"success": True, "config": stt}
+
+
+@app.get("/settings/tts")
+async def get_tts_settings():
+    """Get current TTS configuration."""
+    from shared.config_loader import get_tts_config
+    return {"success": True, "config": get_tts_config()}
+
+
+@app.post("/settings/tts")
+async def update_tts_settings(req: TTSConfigRequest):
+    """Update TTS configuration. Changes take effect on next synthesis."""
+    from shared.config_loader import get_app_config, save_app_config
+    cfg = get_app_config()
+    tts = cfg.get("tts", {})
+    if not isinstance(tts, dict):
+        tts = {}
+    if req.provider is not None:
+        if req.provider != "silero":
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail="Only the silero TTS provider is supported")
+        tts["provider"] = req.provider
+    if req.enabled is not None:
+        tts["enabled"] = req.enabled
+    if req.model_id is not None:
+        tts["model_id"] = req.model_id
+    if req.speaker is not None:
+        tts["speaker"] = req.speaker
+    if req.language is not None:
+        tts["language"] = req.language
+    if req.sample_rate is not None:
+        tts["sample_rate"] = req.sample_rate
+    if req.device is not None:
+        tts["device"] = req.device
+    cfg["tts"] = tts
+    save_app_config(cfg)
+    # Invalidate cached model to force reload with new config
+    try:
+        from server.routes.chat import _invalidate_tts_model
+        _invalidate_tts_model()
+    except Exception:
+        pass
+    return {"success": True, "config": tts}
 
 
 # ============================================================================
@@ -153,16 +359,14 @@ async def stt_transcribe(file: UploadFile = File(...)):
     return await transcribe_audio(file)
 
 
-@app.post("/stt/stream-chunk")
-async def stt_stream_chunk(session_id: str, chunk: str):
-    """Accumulate a base64-encoded audio chunk from the recorder."""
-    return await stream_chunk(session_id, chunk)
-
-
-@app.post("/stt/finalize")
-async def stt_finalize(session_id: str):
-    """Transcribe all accumulated chunks for the session and clear the buffer."""
-    return await finalize(session_id)
+@app.websocket("/stt/stream")
+async def stt_stream_endpoint(
+    websocket: WebSocket,
+    session_id: str,
+    token: str = "",
+):
+    """Bidirectional STT stream: PCM in, partial/final text events out."""
+    await stt_stream(websocket, session_id, token)
 
 
 # Per-launch token + CORS. See server/security.py: the API can run shell
@@ -205,11 +409,15 @@ class ChatRequest(BaseModel):
       "config": { "selected_model": { "provider":"google", "code":"gemini-2.0-flash" } }
     }
 
-    agent_type: "main" → Main Jarvis, "code" → Code Agent
+    agent_type: "main" → Main Jarvis, "code" → Code Agent.
+    The choice comes from the UI and is never guessed from message text.
     """
     message: str
     agent_type: str = "main"
     conversation_id: Optional[str] = None
+    # Explicit UI signal: speak the main-agent reply in voice mode. The backend
+    # never infers this from message text or from the agent type.
+    synthesize_speech: bool = False
 
     # ---- Spec-�?�'�?�?��'�?�?�� (���?��?�?��'��' #1) ----
     primary_spec: Optional[ModelSpec] = None
@@ -331,8 +539,18 @@ def _get_default_provider_and_model(api_keys=None):
     elif config_main.GROQ_API_KEY or os.getenv("GROQ_API_KEY"):
         has_groq = True
 
-    if has_google and not has_groq:
-        return "", "google"
+    has_nim = False
+    if api_keys and isinstance(api_keys, dict) and api_keys.get("nim"):
+        has_nim = True
+    elif getattr(config_main, "NIM_API_KEY", None) or os.getenv("NIM_API_KEY"):
+        has_nim = True
+
+    # Prefer whatever the user actually connected; Groq stays the last resort.
+    if not has_groq:
+        if has_google:
+            return "", "google"
+        if has_nim:
+            return "", "nim"
     return "", "groq"
 
 
@@ -353,6 +571,10 @@ def _resolve_for_request(req: ChatRequest):
         spec_field=(saved["provider"], saved["model"]) if saved else None,
     )
     return pm, pp
+
+
+# Agent routing is explicit: the UI sends `agent_type`. The backend never
+# switches agents based on the message text.
 
 
 def resolve_stream_models(
@@ -406,6 +628,7 @@ async def chat(req: ChatRequest):
             req.config,
             req.disabled_tools,
             req.attachments,
+            req.conversation_id,
         )
     else:
         result = await loop.run_in_executor(
@@ -418,7 +641,9 @@ async def chat(req: ChatRequest):
             pm, pp,
             req.vision_model,
             req.config,
+            req.conversation_id,
             req.attachments,
+            req.synthesize_speech,
         )
     return result
 
@@ -448,6 +673,7 @@ async def chat_stream_endpoint(req: ChatRequest):
         req.config,
         conversation_id=req.conversation_id,
         attachments=req.attachments,
+        synthesize_speech=req.synthesize_speech,
     )
 
 
@@ -516,11 +742,23 @@ class StopAgentRequest(BaseModel):
 
 @app.post("/agent/stop")
 async def agent_stop(req: StopAgentRequest):
-    try:
-        res = agent_job.stop_job(req.conversation_id)
-        return {"ok": True, **res}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    """Cancel the running turn for this conversation.
+
+    Previously a no-op that returned `stopped: False`, so Stop only abandoned
+    the SSE stream while the agent thread kept calling tools and spending quota.
+    Now it flips the turn's `CancelToken`; the agent loop unwinds at its next
+    checkpoint and running shell tools kill their child process.
+    """
+    from shared.cancellation import registry as cancel_registry
+    from shared import agent_job
+
+    stopped = cancel_registry.cancel(req.conversation_id)
+    # Closing the job kills the whole process tree, not just the shell the
+    # agent happened to be waiting on. Returns the real number of descendants.
+    res = agent_job.stop_job(req.conversation_id)
+    if stopped:
+        log.info("[SERVER] Stop requested for conversation %s", req.conversation_id)
+    return {"ok": True, "stopped": stopped, "killed": res.get("killed", 0)}
 
 
 @app.post("/code/chat/stream")

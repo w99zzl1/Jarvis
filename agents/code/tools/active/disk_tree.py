@@ -151,11 +151,6 @@ class DiskTreeTool(Tool):
         "'what does drive D: look like'. Not for filename search — use find_file."
     )
 
-    def verify(self, args: dict, result: "ToolResult") -> "VerificationStatus":
-        from agents.main.tools.registry import VerificationStatus
-
-        return VerificationStatus.UNKNOWN
-
     def reset(self):
         pass
 
@@ -170,8 +165,9 @@ class DiskTreeTool(Tool):
         props["narrate"] = {
             "type": "string",
             "description": (
-                "Short English first-person phrase about what you do right now, "
-                "e.g. 'scanning folder Downloads'. Shown live in chat. Max 60 chars."
+                "Short first-person phrase in the user's language about what you do "
+                "right now, e.g. 'scanning folder Downloads'. Shown live in chat. "
+                "Max 60 chars."
             ),
         }
         params["properties"] = props
@@ -208,7 +204,7 @@ class DiskTreeTool(Tool):
         except ScannerMissing as e:
             return ToolResult(status="error", error=str(e))
 
-        target = resolve_path(self.project_path, path, sandbox=True)
+        target = resolve_path(self.project_path, path)
 
         # The native walk calls this from its own worker threads while the GIL is
         # free, so it has to stay short and must never raise into the extension.

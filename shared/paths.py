@@ -19,9 +19,10 @@ Layout::
     tasks_history.json   background task log
     location_cache.json  geo lookup cache
 
-The agent's *workspace* (the folder its file tools and shell operate in) is a
-separate concept: it is user-configurable and defaults to ``Documents/Jarvis``,
-never to the installation directory.
+The agent's *workspace* is just a hint: the folder the user pointed at so the
+agent knows where "the project" lives. It has no default and never restricts
+what the file tools may touch; it only gives relative paths and the shell a
+starting point.
 """
 
 from __future__ import annotations
@@ -31,7 +32,6 @@ import os
 from pathlib import Path
 
 APP_DIR_NAME = "com.jarvis.assistant"
-DEFAULT_WORKSPACE_NAME = "Jarvis"
 
 
 def app_dir() -> Path:
@@ -103,16 +103,46 @@ def configured_workdir() -> Path | None:
     return None
 
 
-def workspace_dir() -> Path:
-    """Folder the agent works in.
+def workspace_dir() -> Path | None:
+    """Folder the user asked the agent to treat as "the project", if any.
 
-    Priority: ``JARVIS_WORKDIR`` (set by the Tauri shell) -> saved config ->
-    ``Documents/Jarvis``. The install directory is never used as a default.
+    There is deliberately no default: an unset workspace means the user has
+    not told Jarvis where their project is, so the agent works with absolute
+    paths. The workspace is a hint for relative paths / shell cwd and for the
+    system prompt, never an access restriction.
     """
     override = os.environ.get("JARVIS_WORKDIR", "").strip()
     if override:
-        path = Path(override).expanduser()
-    else:
-        path = configured_workdir() or (Path.home() / "Documents" / DEFAULT_WORKSPACE_NAME)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+        return Path(override).expanduser()
+    return configured_workdir()
+
+
+def resolve_path(path: str, *, base: Path | None = None) -> Path:
+    """Resolve an agent-supplied path without sandboxing it.
+
+    Absolute paths are used exactly as given. Relative paths are resolved
+    against ``base`` when provided, otherwise against the user's workspace,
+    otherwise against the user's home directory. Nothing is clamped or
+    rejected based on the workspace: the agent may work anywhere the task
+    requires.
+    """
+    target = Path(path).expanduser()
+    if target.is_absolute():
+        return target.resolve()
+
+    root = base or workspace_dir() or Path.home()
+    return (root / target).resolve()
+
+
+# =============================================================================
+# Only these commands/patterns are allowed. Everything else requires explicit
+# user confirmation (or is blocked entirely for Main Jarvis).
+#
+# Design principle: allow read-only, informational, and development commands.
+# Shell commands are not filtered. The model decides what to run; there is no
+# allowlist or blocklist here (that would be a Claude Code thing it doesn't
+# have either).
+
+
+def get_allowlist_help() -> str:
+    return "No shell command restrictions."

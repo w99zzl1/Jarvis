@@ -61,6 +61,9 @@ _SKIP_SYSTEM_DIRS = {
     "__pycache__",
     ".git",
     "target",
+    # This repo keeps renamed build dirs (target_voicefix, backend-dist). They
+    # contain stale copies of the source and made the agent analyse old code.
+    "backend-dist",
     "dist",
     "build",
     ".venv",
@@ -236,7 +239,10 @@ def _build_and_write() -> None:
 
     for drive in _all_drives():
         for root, dirs, files in os.walk(drive):
-            dirs[:] = [d for d in dirs if d not in _SKIP_SYSTEM_DIRS]
+            dirs[:] = [
+                d for d in dirs
+                if d not in _SKIP_SYSTEM_DIRS and not d.startswith("target_")
+            ]
             for name in files:
                 paths.append(os.path.join(root, name))
             for name in dirs:

@@ -1,4 +1,4 @@
-# Builds the Python backend that ships inside the installer:
+﻿# Builds the Python backend that ships inside the installer:
 #
 #   backend-dist\backend\
 #     python\          embeddable CPython (python.exe + DLLs + Lib\site-packages)
@@ -20,6 +20,28 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# =============================================================================
+# SHA256 Checksums for supply chain security
+# =============================================================================
+# Python 3.10.10 embeddable amd64: https://www.python.org/ftp/python/3.10.10/python-3.10.10-embed-amd64.zip
+# Generated: Get-FileHash python-3.10.10-embed-amd64.zip -Algorithm SHA256
+$PythonEmbedChecksums = @{
+    "3.10.10" = "B8C99A1BCE379287EAE580E7ECD0D8F4AFDCE0A27268D7F26DB205F3362D7BAB"
+}
+# get-pip.py: https://bootstrap.pypa.io/get-pip.py
+# Generated: Get-FileHash get-pip.py -Algorithm SHA256
+$GetPipChecksum = "356E0D0DE21CDC348C3394084D90939B85E4246C4D14C76AEE6CA4F46646EA98"
+
+function Verify-Checksum {
+    param([string]$FilePath, [string]$ExpectedChecksum, [string]$Label)
+    $actual = (Get-FileHash -LiteralPath $FilePath -Algorithm SHA256).Hash.ToLower()
+    $expected = $ExpectedChecksum.ToLower()
+    if ($actual -ne $expected) {
+        throw "$Label checksum mismatch!`n  Expected: $expected`n  Actual:   $actual`n  File:     $FilePath"
+    }
+    Write-Host "    ✓ $Label checksum verified"
+}
 
 $root = Split-Path -Parent $PSScriptRoot
 $dist = Join-Path $root "backend-dist"
@@ -47,6 +69,12 @@ if ($Redownload -or -not (Test-Path -LiteralPath $zip)) {
     $url = "https://www.python.org/ftp/python/$PythonVersion/$zipName"
     Write-Host "    downloading $url"
     Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+}
+# Verify Python embeddable checksum
+if ($PythonEmbedChecksums.ContainsKey($PythonVersion)) {
+    Verify-Checksum -FilePath $zip -ExpectedChecksum $PythonEmbedChecksums[$PythonVersion] -Label "Python $PythonVersion embeddable"
+} else {
+    Write-Warning "No checksum defined for Python $PythonVersion - skipping verification"
 }
 
 # Clean staging area. backend-dist is generated and git-ignored; keep the
@@ -86,6 +114,8 @@ $getPip = Join-Path $cache "get-pip.py"
 if ($Redownload -or -not (Test-Path -LiteralPath $getPip)) {
     Invoke-WebRequest -Uri "https://bootstrap.pypa.io/get-pip.py" -OutFile $getPip -UseBasicParsing
 }
+# Verify get-pip.py checksum
+Verify-Checksum -FilePath $getPip -ExpectedChecksum $GetPipChecksum -Label "get-pip.py"
 Invoke-Exe -Exe $python -What "get-pip.py" -Arguments @(
     "`"$getPip`"", "--no-warn-script-location", "--disable-pip-version-check"
 )

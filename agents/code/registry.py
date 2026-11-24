@@ -4,7 +4,7 @@ import inspect
 from dataclasses import dataclass
 from typing import Any
 
-from agents.main.tools.registry import ToolResult, VerificationStatus
+from agents.main.tools.registry import ToolResult
 from agents.main.tools.search_files import SearchFilesTool
 
 from .tools.active import (
@@ -17,6 +17,7 @@ from .tools.active import (
 )
 from .tools.lazy import WebSearchTool, SearchContentTool, GitStatusTool, GitCommitTool
 from .tools.active import DiskTreeTool
+from .plan_store import PlanStore
 
 
 def _invoke(fn, args: dict):
@@ -90,12 +91,24 @@ class _ToolAdapter:
         except (TypeError, ValueError):
             return False
 
-    def execute(self, args: dict, on_progress=None) -> ToolResult:
+    def _accepts_cancel(self) -> bool:
+        """Whether `execute` declares a `cancel` parameter."""
+        try:
+            return "cancel" in inspect.signature(self.tool.execute).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def execute(self, args: dict, on_progress=None, emit=None, call_id=None,
+                cancel=None) -> ToolResult:
         call_args = dict(args)
         # Only tools that ask for it get the hook, and it is injected after the
         # model's args so a call cannot spoof the callback.
         if on_progress is not None and self._accepts_progress():
             call_args["on_progress"] = on_progress
+        # Only the shell declares `cancel`; it polls the token to kill a running
+        # child process the moment the user presses Stop.
+        if cancel is not None and self._accepts_cancel():
+            call_args["cancel"] = cancel
         try:
             result = _invoke(self.tool.execute, call_args)
         except Exception as e:
@@ -112,10 +125,6 @@ class _ToolAdapter:
         data = {k: v for k, v in result.items() if k != "error" and k != "success"}
         return ToolResult(status=status, data=data, error=result.get("error"))
 
-    def verify(self, args: dict, result: ToolResult) -> VerificationStatus:
-        if result.status != "success":
-            return VerificationStatus.FAILED
-        return VerificationStatus.SUCCESS
 
     def reset(self):
         reset = getattr(self.tool, "reset", None)
@@ -124,8 +133,12 @@ class _ToolAdapter:
 
 
 class CodeToolRegistry:
-    def __init__(self, project_path: str, disabled: set[str] | list[str] | None = None):
+    def __init__(self, project_path: str, disabled: set[str] | list[str] | None = None,
+                 plan_key: str | None = None, plan_store: PlanStore | None = None):
         self.project_path = project_path
+        self.plan_key = plan_key
+        # One store instance per agent, shared by update_plan and the engine.
+        self.plan_store = plan_store if plan_store is not None else PlanStore()
         self._tools: dict[str, _ToolAdapter] = {}
         # Tools the user switched off. They stay registered (so the UI can list
         # them) but are hidden from the LLM schema, the on-demand catalog and
@@ -158,7 +171,8 @@ class CodeToolRegistry:
         active_tools = [
             ReadFileTool(self.project_path),
             WriteFileTool(self.project_path),
-            UpdatePlanTool(self.project_path),
+            UpdatePlanTool(self.project_path, plan_key=self.plan_key,
+                           store=self.plan_store),
             GetToolsTool(self),
             EditFileTool(self.project_path),
             ShellTool(self.project_path),
@@ -254,7 +268,8 @@ class CodeToolRegistry:
             raise KeyError(name)
         return self._tools[name]
 
-    def execute(self, name: str, args: dict, on_progress=None) -> ToolResult:
+    def execute(self, name: str, args: dict, on_progress=None, emit=None, call_id=None,
+                cancel=None) -> ToolResult:
         if name in self.disabled:
             return ToolResult(
                 status="error",
@@ -269,15 +284,7 @@ class CodeToolRegistry:
                     f"{', '.join(sorted(t for t in self._tools if t not in self.disabled))}"
                 ),
             )
-        return tool.execute(args, on_progress=on_progress)
-
-    def verify(self, name: str, args: dict, result: ToolResult) -> VerificationStatus:
-        if name in self.disabled:
-            return VerificationStatus.UNKNOWN
-        tool = self._tools.get(name)
-        if not tool:
-            return VerificationStatus.UNKNOWN
-        return tool.verify(args, result)
+        return tool.execute(args, on_progress=on_progress, cancel=cancel)
 
     def reset_all(self):
         for tool in self._tools.values():

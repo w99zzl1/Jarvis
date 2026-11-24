@@ -3,6 +3,7 @@ import base64
 import io
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -17,42 +18,130 @@ from agents.main.factory import create_agent, create_agent_with_planning
 from agents.main.agent import AgentResult
 from shared.execution_plan import ExecutionEvent, EventType
 from server.conversations import store as conv_store
+from shared.config_loader import get_tts_config
 
 import config.main as config_main
 
 log = logging.getLogger("server")
 
-# Lazy TTS engine - Silero TTS (local neural voice, Russian + English,
-# works offline after first model download, no API key).
+# Silero is the only TTS engine. The model is loaded lazily and only when a
+# request explicitly asks for spoken output (main-agent voice mode).
 _tts_model = None
+_tts_model_signature: tuple | None = None
+_tts_failed_signature: tuple | None = None
 
 
-def _get_tts_model():
-    global _tts_model
-    if _tts_model is not None:
-        return _tts_model
-    try:
-        from silero_tts.silero_tts import SileroTTS
-        model = SileroTTS(model_id="v4_ru", language="ru", speaker="aidar",
-                          sample_rate=48000, device="cpu")
-        _tts_model = model
-        log.info("[TTS] Silero v4_ru loaded")
-        return model
-    except Exception as e:
-        log.warning(f"[TTS] silero-tts unavailable, audio will be silent: {e}")
-        _tts_model = False
+def _get_tts_config() -> dict:
+    """Read TTS config from the shared app config on every synthesis.
+
+    The frontend/Rust side can rewrite api_keys.json without going through the
+    Python settings endpoint, so caching this dict here would silently keep an
+    old voice after the user changed it.
+    """
+    return get_tts_config()
+
+
+def _tts_signature(config: dict) -> tuple:
+    return (
+        config.get("provider"),
+        config.get("model_id"),
+        config.get("language"),
+        config.get("speaker"),
+        config.get("sample_rate"),
+        config.get("device"),
+    )
+
+
+def _tts_is_available(config: dict) -> bool:
+    if config.get("provider", "silero") != "silero":
+        log.warning("[TTS] provider %r is not supported; audio will be silent",
+                    config.get("provider"))
+        return False
+    if config.get("enabled", True) is False:
+        log.info("[TTS] disabled in config; audio will be silent")
+        return False
+    return True
+
+
+def _get_tts_model(config: dict | None = None):
+    """Load (and cache per config) the local Silero model."""
+    global _tts_model, _tts_model_signature, _tts_failed_signature
+    config = config or _get_tts_config()
+    if not _tts_is_available(config):
         return None
 
+    signature = _tts_signature(config)
+    if _tts_model is not None and _tts_model_signature == signature:
+        return _tts_model
+    if _tts_failed_signature == signature:
+        return None
 
-def _synthesize_tts(text: str) -> str | None:
+    try:
+        from silero_tts.silero_tts import SileroTTS
+        model = SileroTTS(
+            model_id=config.get("model_id", "v4_ru"),
+            language=config.get("language", "ru"),
+            speaker=config.get("speaker", "aidar"),
+            sample_rate=config.get("sample_rate", 48000),
+            device=config.get("device", "cpu"),
+        )
+    except Exception as e:
+        log.warning(f"[TTS] silero-tts unavailable, audio will be silent: {e}")
+        _tts_failed_signature = signature
+        return None
+
+    _tts_model = model
+    _tts_model_signature = signature
+    _tts_failed_signature = None
+    log.info(f"[TTS] Silero {config.get('model_id')} loaded (speaker={config.get('speaker')}, lang={config.get('language')})")
+    return model
+
+
+def _invalidate_tts_model():
+    """Force reload of the TTS model (called after settings changes)."""
+    global _tts_model, _tts_model_signature, _tts_failed_signature
+    _tts_model = None
+    _tts_model_signature = None
+    _tts_failed_signature = None
+
+
+def _tts_text(text: str) -> str:
+    """Flatten model markdown before speech synthesis.
+
+    The prompt asks for plain text, but smaller/NIM models still emit headings,
+    bold and code fences. The chat keeps markdown for display, so the reliable
+    place to enforce the TTS contract is here, at the synthesis boundary.
+    """
+    if not text:
+        return text
+    plain = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    plain = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", plain)
+    plain = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", plain)
+    plain = re.sub(r"(?m)^\s*[-*+]\s+", "", plain)
+    plain = re.sub(r"(?m)^\s*\d+\.\s+", "", plain)
+    plain = plain.replace("**", "").replace("__", "").replace("`", "")
+    plain = re.sub(r"(?m)^\s+$", "", plain)
+    plain = re.sub(r"\n\s*\n\s*\n+", "\n\n", plain)
+    return plain.strip()
+
+
+def _synthesize_tts(text: str, voice_mode: bool = False) -> str | None:
     """Generate speech in memory and return base64-encoded WAV audio.
 
-    Silero model produces audio directly into RAM - no temporary files on disk.
+    Called only for main-agent turns that explicitly requested spoken output.
+    Silero writes audio directly into RAM — no temporary files on disk.
     """
+    if not voice_mode:
+        return None
+    config = _get_tts_config()
+    if not _tts_is_available(config):
+        return None
+
+    text = _tts_text(text)
     if not text:
         log.warning("[TTS] empty text, skipping synthesis")
         return None
-    model = _get_tts_model()
+    model = _get_tts_model(config)
     if model is None:
         log.warning("[TTS] model unavailable, audio will be silent")
         return None
@@ -159,6 +248,14 @@ def _map_to_sse_event(internal_event: dict) -> dict | None:
             "task_id": internal_event.get("task_id"),
             "call_id": internal_event.get("call_id"),
         }
+    if etype == "tool_output":
+        return {
+            "type": "tool_output",
+            "tool": internal_event.get("tool") or internal_event.get("tool_name"),
+            "call_id": internal_event.get("call_id"),
+            "output": internal_event.get("output"),
+            "done": internal_event.get("done", False),
+        }
     if etype == "execution_error":
         return {
             "type": "execution_error",
@@ -207,7 +304,8 @@ async def chat_stream(user_input: str, api_keys=None,
                            use_planning: bool = False,
                           primary_spec=None,
                          conversation_id=None,
-                         attachments=None):
+                         attachments=None,
+                         synthesize_speech: bool = False):
     """POST /chat/stream — streaming SSE endpoint for Main Jarvis (WITH EXPLICIT PROVIDERS)."""
     if primary_spec:
         from server.main import resolve_stream_models
@@ -217,13 +315,19 @@ async def chat_stream(user_input: str, api_keys=None,
             primary_provider=primary_provider,
             api_keys=api_keys,
         )
+    from shared.cancellation import registry as cancel_registry
+
+    # The turn's cancellation flag, shared with /agent/stop and with the bus:
+    # a client disconnect (aborted fetch, closed tab) closes the bus, which
+    # cancels the turn even if the explicit stop request never arrived.
+    cid = conversation_id or str(uuid.uuid4())
+    cancel_token = cancel_registry.register(cid)
     # Bounded and lossy for progress ticks: the native scanner's threads push
     # through here while holding the GIL, so this must never block or grow.
-    bus = EventBus()
+    bus = EventBus(on_close=cancel_token.cancel)
 
     def run_agent():
         try:
-            cid = conversation_id or str(uuid.uuid4())
             history = conv_store.load(cid)
 
             # Build user message with attachment context
@@ -297,9 +401,10 @@ async def chat_stream(user_input: str, api_keys=None,
                     base_url=None,
                 )
                 agent.set_event_sink(saving_sink)
+                agent.set_cancel_token(cancel_token)
                 result: AgentResult = agent.run(user_content)
                 conv_store.save(cid, agent.log.events)
-                _tts_audio = _synthesize_tts(result.output or "")
+                _tts_audio = _synthesize_tts(result.output or "", synthesize_speech)
                 log.info(f"[CHAT] final audio={'present' if _tts_audio else 'silent'} for reply len={len(result.output or '')}")
                 bus.push({
                     "type": "final",
@@ -329,10 +434,11 @@ async def chat_stream(user_input: str, api_keys=None,
                     event_sink=bus.push,
                 )
                 agent.set_event_sink(saving_sink)
+                agent.set_cancel_token(cancel_token)
                 agent.load_history(history)
                 result: AgentResult = agent.run(user_content)
                 conv_store.save(cid, agent.log.events)
-                _tts_audio = _synthesize_tts(result.output or "")
+                _tts_audio = _synthesize_tts(result.output or "", synthesize_speech)
                 log.info(f"[CHAT] final audio={'present' if _tts_audio else 'silent'} for reply len={len(result.output or '')}")
                 bus.push({
                     "type": "final",
@@ -356,9 +462,17 @@ async def chat_stream(user_input: str, api_keys=None,
                       "success": False, "state": "failed", "iterations": 0,
                       "tool_calls": 0, "trace_id": None, "model_used": "unknown",
                       "verification_status": None, "verification_reason": None,
-                      "conversation_id": conversation_id})
+                      "conversation_id": cid})
         finally:
+            cancel_registry.unregister(cid, cancel_token)
+            from shared import agent_job
+
+            agent_job.cleanup_job(cid)
             bus.push({"type": DONE})
+
+    # Send handshake event first with schema version
+    from server.event_bus import make_handshake_event
+    bus.push(make_handshake_event())
 
     thread = threading.Thread(target=run_agent, daemon=True)
     thread.start()
@@ -374,7 +488,8 @@ def chat_route(user_input: str, api_keys=None,
                 vision_model: str | None = None,
                 config=None,
                 conversation_id=None,
-                attachments=None) -> dict:
+                attachments=None,
+                synthesize_speech: bool = False) -> dict:
     """Handle /chat request (WITH EXPLICIT PROVIDERS)."""
     cid = conversation_id or str(uuid.uuid4())
     history = conv_store.load(cid)
@@ -437,6 +552,9 @@ def chat_route(user_input: str, api_keys=None,
     return {
         "success": result.success,
         "output": result.output,
+        "reply": result.output,
+        "audio": _synthesize_tts(result.output or "", synthesize_speech),
+        "tool_calls": None,
         "state": result.state,
         "trace_id": result.trace_id,
         "error": result.error,

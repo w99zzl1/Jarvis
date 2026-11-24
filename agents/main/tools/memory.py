@@ -1,4 +1,4 @@
-from .registry import Tool, ToolResult, VerificationStatus
+from .registry import Tool, ToolResult
 from shared.memory.store import MemoryStore
 
 
@@ -45,8 +45,3 @@ class MemoryTool(Tool):
             return ToolResult(status="success", data={"key": key, "message": msg})
 
         return ToolResult(status="error", error=f"Unknown action: {action}")
-
-    def verify(self, args: dict, result: ToolResult) -> VerificationStatus:
-        if result.status != "success":
-            return VerificationStatus.FAILED
-        return VerificationStatus.SUCCESS

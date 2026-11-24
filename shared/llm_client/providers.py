@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
+from shared.cancellation import sleep_interruptible
+
 logger = logging.getLogger("providers")
 
 # httpx logs the full request URL at INFO, and the Gemini API key travels in
@@ -30,6 +32,22 @@ logger = logging.getLogger("providers")
 # the transport quiet unless the app explicitly turns it back on.
 for _noisy in ("httpx", "httpcore", "googleapiclient"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+
+def _stream_timeout():
+    """HTTP timeout for OpenAI-compatible SDK clients (Groq, OpenAI, NIM, ...).
+
+    A bare float is applied as the *read* timeout, so it bounds the gap between
+    two received chunks, not the whole request. With real streaming that gap is
+    all we need to guard: a reasoning model can stay silent for a while before
+    its first visible token, and the old 15s whole-request budget turned those
+    slow starts into spurious timeouts, retries and long UI freezes. Connect is
+    kept short so an unreachable host fails fast. Mirrors GoogleProvider's
+    120s read/stall budget, which likewise resets on every chunk.
+    """
+    import httpx
+
+    return httpx.Timeout(120.0, connect=15.0)
 
 
 def _thought_signature(part: Any) -> Any:
@@ -208,6 +226,16 @@ def _tpm_advice(message: str, max_tokens: int) -> tuple[float, int] | None:
     return max(wait, 20.0), min(max_tokens, headroom)
 
 
+def _tpm_limit(message: str) -> int | None:
+    """The provider's per-minute token ceiling, when the error names one.
+
+    Lets a caller distinguish "the window is busy" (wait and retry) from "the
+    prompt alone is bigger than the window" (only the caller can shrink it).
+    """
+    match = _TPM_LIMIT_RE.search(message or "")
+    return int(match.group(1)) if match else None
+
+
 def _parse_failed_generation(text: str) -> list[dict] | None:
     if not text:
         return None
@@ -312,6 +340,11 @@ class BaseProvider(ABC):
     NAME: str = "base"
     BASE_URL: str | None = None
     UNSUPPORTED_PARAMS: set[str] = set()
+    # Model-name prefixes whose endpoint accepts Anthropic-style
+    # `cache_control` markers. Empty for providers that cache prefixes
+    # implicitly (OpenAI, Groq, Google, NIM) — sending the marker to those
+    # would be an unknown field and a 400.
+    CACHE_CONTROL_MODELS: tuple[str, ...] = ()
 
     def __init__(
         self,
@@ -334,9 +367,11 @@ class BaseProvider(ABC):
         temperature: float = 0.1,
         frequency_penalty: float = 0.3,
         extra: dict | None = None,
+        cancel=None,
     ) -> ChatResponse:
         for attempt in range(3):
             try:
+                max_tokens = self._cap_max_tokens(model, messages, tools, max_tokens)
                 client = self._get_client()
                 kwargs = self._build_request_kwargs(
                     model=model,
@@ -346,6 +381,7 @@ class BaseProvider(ABC):
                     temperature=temperature,
                     frequency_penalty=frequency_penalty,
                 )
+                kwargs = self._apply_prompt_cache(kwargs, model)
                 if extra:
                     kwargs.update(extra)
 
@@ -364,93 +400,144 @@ class BaseProvider(ABC):
                 )
 
             except Exception as e:
-                logger.warning("[LLM] Request failed (attempt %d/3): %s", attempt + 1, e)
-
-                # 1. Groq-specific tool_use_failed recovery (опционально)
-                if self.is_tool_use_failed(e):
-                    recovered = self._try_recover_pseudo_xml(e)
-                    if recovered:
-                        return recovered
-                    # Unrecoverable arguments are usually a one-off generation
-                    # glitch, not a bad key or model: ask again instead of
-                    # failing the whole turn.
-                    if attempt < 2:
-                        logger.warning(
-                            "[LLM] tool_use_failed, retrying request (%d/3)", attempt + 2
-                        )
-                        time.sleep(1.0)
-                        continue
-                    logger.error("[LLM] tool_use_failed could not be recovered")
-                    return ChatResponse(None, None, "fatal", error_message=str(e))
-
-                # 2. Classify error
-                code = self._classify_error(e)
-
-                # Per-minute token budget exhausted (Groq: 413 "Request too
-                # large", 429 "tokens per minute"). Wait for the window and/or
-                # shrink the completion budget instead of dropping the turn.
-                tpm_error = (
-                    self._error_status(e) == 413
-                    or "request too large" in str(e).lower()
-                    or (
-                        self._error_status(e) == 429
-                        and "tokens per minute" in str(e).lower()
-                    )
+                retry, max_tokens, resp = self._resolve_error(
+                    e, attempt, max_tokens, model=model, cancel=cancel
                 )
-                if tpm_error:
-                    advice = _tpm_advice(str(e), max_tokens)
-                    if advice is not None and attempt < 2:
-                        wait, reduced = advice
-                        logger.warning(
-                            "[LLM] Provider TPM limit hit; waiting %.1fs, "
-                            "retrying with max_tokens=%d",
-                            wait, reduced,
-                        )
-                        if wait:
-                            time.sleep(min(wait, 65.0))
-                        max_tokens = reduced
-                        continue
-                    return ChatResponse(
-                        None, None, "error",
-                        error_message=(
-                            "Request exceeds the provider's tokens-per-minute "
-                            "limit even at the smallest output budget. "
-                            "Use a model or plan with a larger TPM limit, or "
-                            "start a new chat to shrink the context. "
-                            f"Provider said: {e}"
-                        ),
-                    )
-
-                if code == "fatal":
-                    logger.error("[LLM] Fatal error: %s", e)
-                    return ChatResponse(None, None, "fatal", error_message=str(e))
-
-                if code == "rate_limit":
-                    logger.warning("[LLM] Rate limit, rotating API key")
-                    next_key = self._km.rotate()
-                    if not next_key:
-                        logger.error("[LLM] No next API key available")
-                        return ChatResponse(None, None, "rate_limited", error_message=str(e))
-                    self._client_cache = None  # переинициируем клиент с новым ключом
+                if retry:
                     continue
-
-                if code == "server":
-                    if attempt < 2:
-                        delay = 2 * (2 ** attempt)
-                        logger.warning("[LLM] Server error, retrying in %ss", delay)
-                        time.sleep(delay)
-                        continue
-                    return ChatResponse(None, None, "server", error_message=str(e))
-
-                logger.error("[LLM] Unhandled error: %s", e)
-                return ChatResponse(None, None, "error", error_message=str(e))
+                return resp
 
         return ChatResponse(None, None, "error")
+
+    def _resolve_error(
+        self,
+        e: Exception,
+        attempt: int,
+        max_tokens: int,
+        *,
+        context: str = "Request",
+        model: str | None = None,
+        cancel=None,
+    ) -> tuple[bool, int, ChatResponse | None]:
+        """Shared failure policy for ask() and ask_stream().
+
+        Returns ``(retry, max_tokens, response)``. When ``retry`` is true the
+        caller loops again with the returned ``max_tokens``; otherwise
+        ``response`` is the terminal result to return (ask) or yield (stream).
+        Keeping one implementation means streaming and non-streaming requests
+        recover from the same provider errors identically.
+        """
+        logger.warning("[LLM] %s failed (attempt %d/3): %s", context, attempt + 1, e)
+
+        # 1. Groq-specific tool_use_failed recovery (опционально)
+        if self.is_tool_use_failed(e):
+            recovered = self._try_recover_pseudo_xml(e)
+            if recovered:
+                return False, max_tokens, recovered
+            # Unrecoverable arguments are usually a one-off generation
+            # glitch, not a bad key or model: ask again instead of
+            # failing the whole turn.
+            if attempt < 2:
+                logger.warning(
+                    "[LLM] tool_use_failed, retrying request (%d/3)", attempt + 2
+                )
+                sleep_interruptible(1.0, token=cancel)
+                return True, max_tokens, None
+            logger.error("[LLM] tool_use_failed could not be recovered")
+            return False, max_tokens, ChatResponse(None, None, "fatal", error_message=str(e))
+
+        # 2. Classify error
+        code = self._classify_error(e)
+
+        # Per-minute token budget exhausted (Groq: 413 "Request too
+        # large", 429 "tokens per minute"). Wait for the window and/or
+        # shrink the completion budget instead of dropping the turn.
+        tpm_error = (
+            self._error_status(e) == 413
+            or "request too large" in str(e).lower()
+            or (
+                self._error_status(e) == 429
+                and "tokens per minute" in str(e).lower()
+            )
+        )
+        if tpm_error:
+            limit = _tpm_limit(str(e))
+            if limit is not None and model:
+                # Remember the window so later requests are sized to fit up front
+                # instead of being rejected once more.
+                self._TPM_LIMITS[f"{self.NAME}:{model}"] = limit
+            advice = _tpm_advice(str(e), max_tokens)
+            if advice is not None and attempt < 2:
+                wait, reduced = advice
+                logger.warning(
+                    "[LLM] Provider TPM limit hit; waiting %.1fs, "
+                    "retrying with max_tokens=%d",
+                    wait, reduced,
+                )
+                if wait:
+                    sleep_interruptible(min(wait, 65.0), token=cancel)
+                return True, reduced, None
+            # The request does not fit the window even at the smallest output
+            # budget, so no retry can help: the prompt itself is too large. This
+            # is a distinct, recoverable condition — the caller owns the
+            # conversation and is the only one who can shrink the prompt — so it
+            # is reported as `context_too_large` instead of a generic failure.
+            if _tpm_limit(str(e)) is not None:
+                return False, max_tokens, ChatResponse(
+                    None, None, "context_too_large",
+                    error_message=(
+                        "The prompt exceeds the provider's tokens-per-minute "
+                        "limit before any output is generated. "
+                        f"Provider said: {e}"
+                    ),
+                )
+            return False, max_tokens, ChatResponse(
+                None, None, "error",
+                error_message=(
+                    "Request exceeds the provider's tokens-per-minute "
+                    "limit even at the smallest output budget. "
+                    "Use a model or plan with a larger TPM limit, or "
+                    "start a new chat to shrink the context. "
+                    f"Provider said: {e}"
+                ),
+            )
+
+        if code == "fatal":
+            logger.error("[LLM] Fatal error: %s", e)
+            return False, max_tokens, ChatResponse(None, None, "fatal", error_message=str(e))
+
+        if code == "rate_limit":
+            logger.warning("[LLM] Rate limit, rotating API key")
+            next_key = self._km.rotate()
+            if not next_key:
+                logger.error("[LLM] No next API key available")
+                return False, max_tokens, ChatResponse(
+                    None, None, "rate_limited", error_message=str(e)
+                )
+            self._client_cache = None  # переинициируем клиент с новым ключом
+            return True, max_tokens, None
+
+        if code == "server":
+            if attempt < 2:
+                delay = 2 * (2 ** attempt)
+                logger.warning("[LLM] Server error, retrying in %ss", delay)
+                sleep_interruptible(delay, token=cancel)
+                return True, max_tokens, None
+            return False, max_tokens, ChatResponse(None, None, "server", error_message=str(e))
+
+        logger.error("[LLM] Unhandled error: %s", e, exc_info=True)
+        return False, max_tokens, ChatResponse(None, None, "error", error_message=str(e))
 
     # ------------------------------------------------------------------
     # Streaming entrypoint.
     # Yields ("delta", text_so_far) tuples and finally ("done", ChatResponse).
-    # Default implementation: no real streaming, emit the whole answer at once.
+    #
+    # OpenAI-compatible SDKs (Groq, OpenAI, OpenRouter, NIM) stream natively, so
+    # we ask for `stream=True` and forward each token instead of blocking on the
+    # whole completion. The old default buffered the entire answer and emitted
+    # it as one delta, which is why those providers showed no token streaming:
+    # the UI sat silent through a long reasoning pass, then the whole reply
+    # appeared at once, and every iteration read as a freeze followed by a burst.
     # ------------------------------------------------------------------
     def ask_stream(
         self,
@@ -460,18 +547,107 @@ class BaseProvider(ABC):
         max_tokens: int = 1024,
         temperature: float = 0.1,
         frequency_penalty: float = 0.3,
+        cancel=None,
     ):
-        resp = self.ask(
-            model=model,
-            messages=messages,
-            tools=tools,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            frequency_penalty=frequency_penalty,
-        )
-        if resp.content:
-            yield ("delta", resp.content)
-        yield ("done", resp)
+        for attempt in range(3):
+            # Stop before spending another provider call on a cancelled turn.
+            if cancel is not None:
+                cancel.check()
+            text_parts: list[str] = []
+            # index -> {id, name, arguments}. OpenAI streams tool calls as
+            # fragments keyed by `index`, so they are accumulated, not replaced.
+            tool_slots: dict[int, dict] = {}
+            finish_reason = "stop"
+            try:
+                max_tokens = self._cap_max_tokens(model, messages, tools, max_tokens)
+                client = self._get_client()
+                kwargs = self._build_request_kwargs(
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    frequency_penalty=frequency_penalty,
+                )
+                kwargs = self._apply_prompt_cache(kwargs, model)
+                kwargs["stream"] = True
+
+                stream = client.chat.completions.create(**kwargs)
+                for chunk in stream:
+                    choices = getattr(chunk, "choices", None)
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    fr = getattr(choice, "finish_reason", None)
+                    if fr:
+                        finish_reason = fr
+                    delta = getattr(choice, "delta", None)
+                    if delta is None:
+                        continue
+
+                    piece = getattr(delta, "content", None)
+                    if piece:
+                        text_parts.append(piece)
+                        # Cumulative snapshot: a mid-stream retry replaces the
+                        # partial text instead of duplicating it.
+                        yield ("delta", "".join(text_parts))
+
+                    for tc in getattr(delta, "tool_calls", None) or []:
+                        idx = getattr(tc, "index", None)
+                        idx = 0 if idx is None else idx
+                        slot = tool_slots.setdefault(
+                            idx, {"id": "", "name": "", "arguments": ""}
+                        )
+                        tc_id = getattr(tc, "id", None)
+                        if tc_id:
+                            slot["id"] = tc_id
+                        fn = getattr(tc, "function", None)
+                        if fn is not None:
+                            name = getattr(fn, "name", None)
+                            if name:
+                                slot["name"] = name
+                            args_piece = getattr(fn, "arguments", None)
+                            if args_piece:
+                                slot["arguments"] += args_piece
+
+                content = "".join(text_parts) or None
+                tool_calls = None
+                if tool_slots:
+                    tool_calls = [
+                        SimpleNamespace(
+                            id=slot["id"] or f"call_{idx}",
+                            type="function",
+                            function=SimpleNamespace(
+                                name=slot["name"],
+                                arguments=slot["arguments"] or "{}",
+                            ),
+                        )
+                        for idx, slot in sorted(tool_slots.items())
+                    ]
+                    if finish_reason == "stop":
+                        finish_reason = "tool_calls"
+
+                yield ("done", ChatResponse(
+                    content=content,
+                    tool_calls=tool_calls,
+                    finish_reason=finish_reason,
+                ))
+                return
+
+            except Exception as e:
+                retry, max_tokens, resp = self._resolve_error(
+                    e, attempt, max_tokens, context="Stream", model=model,
+                    cancel=cancel,
+                )
+                if retry:
+                    continue
+                yield ("done", resp)
+                return
+
+        # Mirrors ask(): a retry requested on the final attempt (e.g. a key
+        # rotation) must still close the stream with a terminal response, or the
+        # caller waits forever for a "done" that never comes.
+        yield ("done", ChatResponse(None, None, "error"))
 
     # ------------------------------------------------------------------
     # Structured Output support
@@ -496,6 +672,31 @@ class BaseProvider(ABC):
     # ------------------------------------------------------------------
     # Абстрактные / переопределяемые хуки
     # ------------------------------------------------------------------
+
+    def _apply_prompt_cache(self, kwargs: dict, model: str) -> dict:
+        """Mark the system block cacheable on endpoints that support it.
+
+        The agent keeps the prompt prefix byte-stable (see ContextBuilder);
+        this only adds the explicit marker for routed Anthropic models.
+        """
+        if not self.CACHE_CONTROL_MODELS:
+            return kwargs
+        if not any(model.startswith(p) for p in self.CACHE_CONTROL_MODELS):
+            return kwargs
+        messages = kwargs.get("messages") or []
+        if not messages:
+            return kwargs
+        first = messages[0]
+        if first.get("role") != "system" or not isinstance(first.get("content"), str):
+            return kwargs
+        marked = dict(first)
+        marked["content"] = [{
+            "type": "text",
+            "text": first["content"],
+            "cache_control": {"type": "ephemeral"},
+        }]
+        kwargs["messages"] = [marked] + list(messages[1:])
+        return kwargs
 
     @abstractmethod
     def _create_client(self, api_key: str):
@@ -522,6 +723,58 @@ class BaseProvider(ABC):
                 raise RuntimeError(f"No API key available for provider '{self.NAME}'")
             self._client_cache = self._create_client(key)
         return self._client_cache
+
+    # ------------------------------------------------------------------
+    # Proactive request sizing against a learned token window
+    # ------------------------------------------------------------------
+
+    # Per-minute token ceilings learned from a provider rejection, keyed by
+    # "provider:model". Nothing advertises them (Groq free tier is 8000 TPM),
+    # so the first rejection teaches us and every later request is sized to fit
+    # before it is sent — instead of eating the rejection, the retry wait and
+    # the second round-trip on each call.
+    _TPM_LIMITS: dict[str, int] = {}
+
+    @staticmethod
+    def _estimate_tokens(messages: list[dict], tools: list[dict] | None) -> int:
+        """Rough prompt size: the char/3 heuristic the agent already uses.
+
+        Undercounting is safe (the rejection path still catches it); it only
+        has to be close enough to size `max_tokens` sensibly.
+        """
+        chars = 0
+        for m in messages or []:
+            content = m.get("content")
+            if isinstance(content, str):
+                chars += len(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        chars += len(block.get("text", ""))
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                chars += len(fn.get("name", "")) + len(fn.get("arguments", ""))
+        if tools:
+            try:
+                chars += len(json.dumps(tools, ensure_ascii=False))
+            except Exception:
+                pass
+        return chars // 3 + 4 * len(messages or [])
+
+    def _cap_max_tokens(
+        self,
+        model: str,
+        messages: list[dict],
+        tools: list[dict] | None,
+        max_tokens: int,
+    ) -> int:
+        """Clamp the completion budget so prompt + output fits the learned window."""
+        limit = self._TPM_LIMITS.get(f"{self.NAME}:{model}")
+        if not limit:
+            return max_tokens
+        prompt = self._estimate_tokens(messages, tools)
+        room = limit - prompt - _TPM_MIN_OUTPUT
+        return max(1, min(max_tokens, room))
 
     def _try_recover_pseudo_xml(self, err: Exception) -> ChatResponse | None:
         failed = self._extract_failed_generation(err)
@@ -615,7 +868,7 @@ class GroqProvider(BaseProvider):
 
     def _create_client(self, api_key: str):
         from groq import Groq
-        return Groq(api_key=api_key, timeout=15.0)
+        return Groq(api_key=api_key, timeout=_stream_timeout())
 
     def _build_request_kwargs(self, model, messages, tools, max_tokens, temperature, frequency_penalty) -> dict:
         kwargs = {
@@ -865,50 +1118,30 @@ class GoogleProvider(BaseProvider):
             return None
         return name
 
-# ------------------------------------------------------------------
-    # Retry / key rotation
-    #
-    # GoogleProvider predates the retry loop in BaseProvider.ask and, by
-    # overriding ask()/ask_stream() without re-implementing it, a single
-    # transient `503 UNAVAILABLE` from Gemini killed the whole agent run
-    # after exactly one HTTP request: no backoff, no key rotation, and the
-    # error was flattened to the generic token "error" so the agent could not
-    # tell a capacity blip from a bad request.
-    # ------------------------------------------------------------------
+    # Retry / backoff / key rotation live in the two loops below (mirroring
+    # BaseProvider.ask/ask_stream, which this provider predates and cannot
+    # inherit because its request shape is different). These two helpers keep
+    # the actual API calls in one place so both loops stay in sync.
     ATTEMPTS = 3
 
-    def _retryable(self, call, *args, **kwargs) -> ChatResponse:
-        """Run `call` with backoff + key rotation, mirroring BaseProvider.ask."""
-        last_code = "error"
-        for attempt in range(self.ATTEMPTS):
-            try:
-                return call(*args, **kwargs)
-            except Exception as e:  # noqa: BLE001 - classified below
-                code = self._classify_error(e)
-                last_code = code
-                logger.warning(
-                    "[GoogleProvider] %s error (attempt %d/%d): %s",
-                    code, attempt + 1, self.ATTEMPTS, e,
-                )
+    def _make_request(self, model: str, contents: list, config, allowed_names: set[str]) -> ChatResponse:
+        """Execute a single generate_content request and read it back."""
+        client = self._get_client()
+        response = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config,
+        )
+        return self._read_response(response, allowed_names)
 
-                if code == "fatal":
-                    return ChatResponse(None, None, "fatal", error_message=str(e))
-
-                if code == "rate_limit":
-                    if self._km.rotate():
-                        self._client_cache = None
-                        time.sleep(min(2 * (2 ** attempt), 20))
-                        continue
-                    return ChatResponse(None, None, "rate_limited", error_message=str(e))
-
-                if code == "server":
-                    if attempt < self.ATTEMPTS - 1:
-                        time.sleep(min(2 * (2 ** attempt), 20))
-                        continue
-                    return ChatResponse(None, None, "server", error_message=str(e))
-
-                return ChatResponse(None, None, "error", error_message=str(e))
-        return ChatResponse(None, None, last_code)
+    def _make_stream_request(self, model: str, contents: list, config):
+        """Execute a single generate_content_stream request. Returns the stream iterator."""
+        client = self._get_client()
+        return client.models.generate_content_stream(
+            model=model,
+            contents=contents,
+            config=config,
+        )
 
     def _build_stream_request(self, messages, tools, max_tokens, temperature, _types):
         """Shared request assembly for ask()/ask_stream()."""
@@ -931,6 +1164,16 @@ class GoogleProvider(BaseProvider):
         config_kwargs = {
             "max_output_tokens": max_tokens,
             "temperature": temperature,
+            # We run the tool loop ourselves and execute every function call
+            # outside the SDK, so automatic function calling must stay off. It
+            # is on by default, and its per-chunk bookkeeping (`candidates[0]`)
+            # crashes with "list index out of range" on a blocked or empty
+            # chunk — Gemini legitimately returns `candidates=[]` there, e.g.
+            # right after a 503 — which then surfaces as a fatal provider error
+            # instead of a retry.
+            "automatic_function_calling": _types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
         }
         if gemini_tools:
             config_kwargs["tools"] = gemini_tools
@@ -946,23 +1189,44 @@ class GoogleProvider(BaseProvider):
             "temperature": temperature,
         }
 
-    def ask(self, model, messages, tools=None, max_tokens=1024, temperature=0.1, frequency_penalty=0.3, extra=None) -> ChatResponse:
+    def ask(self, model, messages, tools=None, max_tokens=1024, temperature=0.1, frequency_penalty=0.3, extra=None, cancel=None) -> ChatResponse:
+        """Non-streaming request with retry logic (mirrors BaseProvider.ask)."""
         from google.genai import types as _types
 
         contents, config, allowed_names = self._build_stream_request(
             messages, tools, max_tokens, temperature, _types
         )
 
-        def call():
-            client = self._get_client()
-            response = client.models.generate_content(
-                model=model,
-                contents=contents,
-                config=config,
-            )
-            return self._read_response(response, allowed_names)
+        for attempt in range(self.ATTEMPTS):
+            try:
+                return self._make_request(model, contents, config, allowed_names)
 
-        return self._retryable(call)
+            except Exception as e:
+                code = self._classify_error(e)
+                logger.warning(
+                    "[GoogleProvider] %s error (attempt %d/%d): %s",
+                    code, attempt + 1, self.ATTEMPTS, e,
+                )
+
+                if code == "fatal":
+                    return ChatResponse(None, None, "fatal", error_message=str(e))
+
+                if code == "rate_limit":
+                    if self._km.rotate():
+                        self._client_cache = None
+                        sleep_interruptible(min(2 * (2 ** attempt), 20), token=cancel)
+                        continue
+                    return ChatResponse(None, None, "rate_limited", error_message=str(e))
+
+                if code == "server":
+                    if attempt < self.ATTEMPTS - 1:
+                        sleep_interruptible(min(2 * (2 ** attempt), 20), token=cancel)
+                        continue
+                    return ChatResponse(None, None, "server", error_message=str(e))
+
+                return ChatResponse(None, None, "error", error_message=str(e))
+
+        return ChatResponse(None, None, "error")
 
     def _read_response(self, response, allowed_names: set[str]) -> ChatResponse:
         """Turn a completed `generate_content` response into a ChatResponse."""
@@ -1050,6 +1314,7 @@ class GoogleProvider(BaseProvider):
         max_tokens: int = 1024,
         temperature: float = 0.1,
         frequency_penalty: float = 0.3,
+        cancel=None,
     ):
         from google.genai import types as _types
 
@@ -1061,20 +1326,27 @@ class GoogleProvider(BaseProvider):
         # is restarted from scratch. Emitting the partial text would leave the
         # model with a half-written message that it then has to reconcile.
         for attempt in range(self.ATTEMPTS):
+            # Stop before spending another provider call on a cancelled turn.
+            if cancel is not None:
+                cancel.check()
             text_parts: list[str] = []
             tool_call_dicts: list[dict] = []
             images: list[str] = []
             finish_reason = "stop"
+            truncated = False
 
             try:
-                stream = self._get_client().models.generate_content_stream(
-                    model=model,
-                    contents=contents,
-                    config=config,
-                )
+                stream = self._make_stream_request(model, contents, config)
                 for chunk in stream:
                     if getattr(chunk, "candidates", None):
                         candidate = chunk.candidates[0]
+                        # Gemini signals a cut-off answer (including a thinking
+                        # budget spent) as MAX_TOKENS. Record it so the agent
+                        # does not treat half an answer as a clean stop.
+                        fr = getattr(candidate, "finish_reason", None)
+                        fr_name = str(getattr(fr, "name", fr) or "").upper()
+                        if "MAX_TOKENS" in fr_name or "MAX_OUTPUT_TOKENS" in fr_name:
+                            truncated = True
                         if getattr(candidate, "content", None):
                             for part in candidate.content.parts:
                                 t = getattr(part, "text", None)
@@ -1128,12 +1400,22 @@ class GoogleProvider(BaseProvider):
                     # Deltas are cumulative snapshots, so restarting simply
                     # replaces the partial text instead of duplicating it.
                     self._client_cache = None
-                    time.sleep(min(2 * (2 ** attempt), 20))
+                    sleep_interruptible(min(2 * (2 ** attempt), 20), cancel)
                     continue
+                if code == "error":
+                    # Unclassified failures used to surface as a bare message
+                    # ("list index out of range") with no way to find the
+                    # origin. Keep the traceback.
+                    logger.error("[GoogleProvider] Unhandled stream error", exc_info=True)
                 yield ("done", ChatResponse(None, None, code, error_message=str(e)))
                 return
 
             break
+
+        # A MAX_TOKENS cut must not masquerade as a clean stop. Only downgrade
+        # when no tool call was emitted, since an emitted tool call still runs.
+        if truncated and not tool_call_dicts:
+            finish_reason = "length"
 
         content = "".join(text_parts) or None
 
@@ -1200,7 +1482,7 @@ class OpenAIProvider(BaseProvider):
 
     def _create_client(self, api_key: str):
         from openai import OpenAI
-        return OpenAI(api_key=api_key, base_url=self._base_url, timeout=15.0)
+        return OpenAI(api_key=api_key, base_url=self._base_url, timeout=_stream_timeout())
 
     def _build_request_kwargs(self, model, messages, tools, max_tokens, temperature, frequency_penalty) -> dict:
         kwargs = {
@@ -1258,6 +1540,7 @@ class OpenRouterProvider(OpenAIProvider):
     # OpenRouter routes to many vendors; some reject OpenAI-only sampling params
     # with a 400, so drop the ones that commonly fail.
     UNSUPPORTED_PARAMS = {"frequency_penalty", "presence_penalty"}
+    CACHE_CONTROL_MODELS = ("anthropic/", "claude-")
 
     def _build_request_kwargs(self, model, messages, tools, max_tokens, temperature, frequency_penalty) -> dict:
         kwargs = super()._build_request_kwargs(
@@ -1297,7 +1580,7 @@ class OpenAICompatibleProvider(BaseProvider):
 
     def _create_client(self, api_key: str):
         from openai import OpenAI
-        return OpenAI(api_key=api_key, base_url=self._base_url, timeout=15.0)
+        return OpenAI(api_key=api_key, base_url=self._base_url, timeout=_stream_timeout())
 
     def _build_request_kwargs(self, model, messages, tools, max_tokens, temperature, frequency_penalty) -> dict:
         kwargs = {

@@ -1,7 +1,7 @@
 import subprocess
 import time
 
-from .registry import Tool, ToolResult, VerificationStatus
+from .registry import Tool, ToolResult
 
 
 class ClipboardTool(Tool):
@@ -31,8 +31,3 @@ class ClipboardTool(Tool):
         except Exception as e:
             elapsed = time.time() - start
             return ToolResult(status="error", error=str(e), metadata={"execution_time": elapsed})
-
-    def verify(self, args: dict, result: ToolResult) -> VerificationStatus:
-        if result.status == "success":
-            return VerificationStatus.SUCCESS
-        return VerificationStatus.FAILED

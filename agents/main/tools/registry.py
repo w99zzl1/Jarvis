@@ -1,6 +1,6 @@
+import inspect
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -9,120 +9,9 @@ from typing import Any
 logger = logging.getLogger("registry")
 
 
-class VerificationStatus(str, Enum):
-    SUCCESS = "success"
-    FAILED = "failed"
-    UNKNOWN = "unknown"
-
-
 class AttemptStatus(str, Enum):
     COMPLETED = "completed"
     RETRY = "retry"
-
-
-class ToolRiskLevel(str, Enum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    CRITICAL = "critical"
-
-
-class PreflightCheck:
-    """Preflight check result for a tool call."""
-    def __init__(self, allowed: bool, risk_level: ToolRiskLevel = ToolRiskLevel.LOW,
-                 reason: str = "", suggestions: list[str] = None):
-        self.allowed = allowed
-        self.risk_level = risk_level
-        self.reason = reason
-        self.suggestions = suggestions or []
-
-    def to_dict(self) -> dict:
-        return {
-            "allowed": self.allowed,
-            "risk_level": self.risk_level.value,
-            "reason": self.reason,
-            "suggestions": self.suggestions,
-        }
-
-
-def _preflight_check(name: str, args: dict) -> "PreflightCheck":
-    """Preflight check for tool calls. Returns a check result."""
-    # Shell-specific checks
-    if name in ("run_powershell", "run_cmd"):
-        interpreter = args.get("interpreter", "powershell")
-        script = args.get("command", "")
-        if not script:
-            return PreflightCheck(allowed=True, risk_level=ToolRiskLevel.LOW)
-        
-        # Normalize script for pattern matching (handle aliases)
-        script_lower = script.lower()
-        
-        # Normalize common aliases to their canonical forms for detection
-        normalized = script_lower
-        # gci, dir, ls -> Get-ChildItem
-        normalized = re.sub(r'\b(gci|dir|ls)\b', 'get-childitem', normalized)
-        # mi, cp, copy -> Copy-Item
-        normalized = re.sub(r'\b(mi|cp|copy)\b', 'copy-item', normalized)
-        # ri, del, rm -> Remove-Item
-        normalized = re.sub(r'\b(ri|del|rm)\b', 'remove-item', normalized)
-        # ni, mkdir -> New-Item
-        normalized = re.sub(r'\b(ni|mkdir)\b', 'new-item', normalized)
-        # gi, gu -> Get-Item
-        normalized = re.sub(r'\b(gi|gu)\b', 'get-item', normalized)
-        # % -> ForEach-Object
-        normalized = re.sub(r'%', 'foreach-object', normalized)
-        # ? -> Where-Object
-        normalized = re.sub(r'\?', 'where-object', normalized)
-        
-        # Dangerous patterns: recursive scan on system drives
-        if re.search(r'get-childitem\s+.*-recurse', normalized, re.IGNORECASE):
-            if re.search(r'(?:^|\s)(?:c:|d:|e:|\\|/)\s*', normalized):
-                return PreflightCheck(
-                    allowed=False,
-                    risk_level=ToolRiskLevel.CRITICAL,
-                    reason="Recursive filesystem scan on system drive detected. This can take minutes and freeze the system.",
-                    suggestions=[
-                        "Use Get-PSDrive to check disk usage first",
-                        "Target specific directories instead of recursive root scan",
-                        "Use Get-PSDrive C | Select-Object Used,Free to check space"
-                    ]
-                )
-        
-        # Dangerous: recursive operations without limits
-        if re.search(r'-recurse', normalized, re.IGNORECASE):
-            if not re.search(r'-maxdepth|-depth|select-object\s+-first\s+\d+', normalized, re.IGNORECASE):
-                return PreflightCheck(
-                    allowed=True,  # Allow but warn
-                    risk_level=ToolRiskLevel.HIGH,
-                    reason="Recursive operation without depth limit or result limit. May traverse large directory trees.",
-                    suggestions=[
-                        "Add -MaxDepth parameter to limit recursion depth",
-                        "Add | Select-Object -First N to limit results",
-                        "Target specific subdirectories instead of root"
-                    ]
-                )
-        
-        # Dangerous: system modifications with -Force
-        if re.search(r'(?:remove-item|remove-itemproperty|set-itemproperty|new-itemproperty)\s.*-force', normalized, re.IGNORECASE):
-            return PreflightCheck(
-                allowed=True,
-                risk_level=ToolRiskLevel.HIGH,
-                reason="Forced system modification detected. May cause system instability.",
-                suggestions=["Remove -Force flag unless absolutely necessary", "Test without -Force first"]
-            )
-        
-        # Expensive: WMI/CIM queries
-        if re.search(r'get-ciminstance|get-wmiobject', normalized, re.IGNORECASE):
-            if not re.search(r'-filter|where-object\s*\{', normalized, re.IGNORECASE):
-                return PreflightCheck(
-                    allowed=True,
-                    risk_level=ToolRiskLevel.MEDIUM,
-                    reason="WMI query without filter may query large datasets.",
-                    suggestions=["Add -Filter or Where-Object clause to limit results"]
-                )
-    
-    # Default: allow with low risk
-    return PreflightCheck(allowed=True, risk_level=ToolRiskLevel.LOW)
 
 
 @dataclass
@@ -149,37 +38,62 @@ class ToolResult:
         self.metadata["execution_time"] = value
 
     def to_text(self) -> str:
+        """Render the result for the model.
+
+        Failures carry the full stdout/stderr/exit code when the tool provides
+        them. Truncating a traceback to a few hundred characters used to hide
+        the actual exception and made the model guess at fixes. The single cap
+        below is a context-window safety limit, not a per-tool heuristic.
+        """
+        cap = 8000
         if self.error or self.status != "success":
-            lines = [
-                "[TOOL FAILURE]",
-                f"Status: {self.status}",
-            ]
+            lines = ["[TOOL FAILURE]", f"Status: {self.status}"]
             if self.error:
                 lines.append(f"Error: {self.error}")
-            if self.metadata.get("exit_code") is not None:
-                lines.append(f"Exit code: {self.metadata['exit_code']}")
+            exit_code = self.metadata.get("exit_code")
+            if exit_code is None:
+                exit_code = self.data.get("exit_code")
+            if exit_code is not None:
+                lines.append(f"Exit code: {exit_code}")
             if self.data:
-                lines.append(f"Data: {json.dumps(self.data, ensure_ascii=False)[:500]}")
-            return "\n".join(lines)
+                for key in ("stdout", "stderr"):
+                    value = self.data.get(key)
+                    if value:
+                        lines.append(f"{key.upper()}:\n{value}")
+                other = {
+                    k: v for k, v in self.data.items()
+                    if k not in ("stdout", "stderr", "exit_code")
+                }
+                if other:
+                    lines.append(json.dumps(other, ensure_ascii=False, default=str))
+            return "\n".join(lines)[:cap]
 
         if self.text is not None:
-            return self.text
+            return self.text[:cap]
 
         if not self.data:
             return "OK"
-        return json.dumps(self.data, ensure_ascii=False)
+        return json.dumps(self.data, ensure_ascii=False, default=str)[:cap]
 
     def to_dict(self) -> dict:
+        # `text`/`summary` are part of the result a tool can return. Leaving them
+        # out here silently lost plain-text results between the engine and the
+        # streaming UI, which only ever sees this serialized form.
         return {
             "status": self.status,
             "data": self.data,
             "error": self.error,
             "metadata": self.metadata,
+            "text": self.text,
+            "summary": self.summary,
         }
 
     def __str__(self):
         status = self.status.upper()
-        brief = json.dumps(self.data, ensure_ascii=False)[:200] if self.data else "(empty)"
+        brief = (
+            json.dumps(self.data, ensure_ascii=False, default=str)[:200]
+            if self.data else "(empty)"
+        )
         return f"[{status} {self.execution_time:.2f}s] {brief}"
 
 
@@ -212,9 +126,6 @@ class Tool(ToolMeta):
     def execute(self, args: dict) -> ToolResult:
         raise NotImplementedError
 
-    def verify(self, args: dict, result: ToolResult) -> "VerificationStatus":
-        return VerificationStatus.UNKNOWN
-
     def reset(self):
         """Reset per-request state. Called once at the start of each agent.run()."""
         pass
@@ -232,8 +143,9 @@ class Tool(ToolMeta):
         props["narrate"] = {
             "type": "string",
             "description": (
-                "Short English first-person phrase about what you do right now, "
-                "e.g. 'reading notes notes.txt'. Shown live in chat. Max 60 chars."
+                "Short first-person phrase in the user's language about what you do "
+                "right now, e.g. 'reading notes notes.txt'. Shown live in chat. "
+                "Max 60 chars."
             ),
         }
         params["properties"] = props
@@ -255,7 +167,7 @@ class GetToolsTool(Tool):
         super().__init__()
         self.name = "get_tools"
         self.description = (
-            "Load the JSON schema of a lazy tool, then call it directly. "
+            "Load the JSON schema of a registered tool, then call it directly. "
             "Call it with no tool_name to list every lazy tool with its purpose. "
             "Lazy tools are listed in the system prompt; load one before calling it."
         )
@@ -380,16 +292,8 @@ class ToolRegistry:
             raise KeyError(f"Unknown tool: {name}")
         return tool
 
-    def execute(self, name: str, args: dict) -> ToolResult:
-        # Run preflight check — log warnings but never block.
-        # The Execution Planner in agent.py decides whether to proceed.
-        preflight = _preflight_check(name, args)
-        if preflight.risk_level in (ToolRiskLevel.HIGH, ToolRiskLevel.CRITICAL):
-            logger.warning(
-                f"[TOOL:{name}] RISK={preflight.risk_level.value}: {preflight.reason}. "
-                f"Suggestions: {preflight.suggestions}"
-            )
-
+    def execute(self, name: str, args: dict, emit=None, call_id=None, on_progress=None,
+                cancel=None) -> ToolResult:
         tool = self._tools.get(name)
         if not tool:
             return ToolResult(
@@ -402,7 +306,26 @@ class ToolRegistry:
         logger.info(f"[TOOL:{name}] executing args={json.dumps(args, ensure_ascii=False)[:200]}")
         start = time.time()
         try:
-            result = tool.execute(args)
+            # Only pass emit/call_id/on_progress to tools that declare them as
+            # parameters. co_varnames includes local variables (e.g. disk_tree
+            # has a local `emit`), so we must inspect the signature, not
+            # co_varnames.
+            extra = {}
+            try:
+                sig_params = inspect.signature(tool.execute).parameters
+            except (TypeError, ValueError):
+                sig_params = {}
+            if 'emit' in sig_params:
+                extra['emit'] = emit
+            if 'call_id' in sig_params:
+                extra['call_id'] = call_id
+            if 'on_progress' in sig_params:
+                extra['on_progress'] = on_progress
+            # Only long-running tools (the shell) declare `cancel`; the loop
+            # unwinds every other tool between calls.
+            if 'cancel' in sig_params:
+                extra['cancel'] = cancel
+            result = tool.execute(args, **extra)
             result.execution_time = time.time() - start
             logger.info(f"[TOOL:{name}] done in {result.execution_time:.2f}s status={result.status}")
             return result
@@ -410,10 +333,6 @@ class ToolRegistry:
             elapsed = time.time() - start
             logger.error(f"[TOOL:{name}] exception after {elapsed:.2f}s: {e}")
             return ToolResult(status="error", error=str(e), metadata={"execution_time": elapsed})
-
-    def verify(self, name: str, args: dict, result: ToolResult) -> "VerificationStatus":
-        tool = self.get(name)
-        return tool.verify(args, result)
 
     def reset_all(self):
         """Reset per-request state on all registered tools."""

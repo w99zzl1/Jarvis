@@ -1,9 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Loader2, ListChecks } from "lucide-react";
 
-const CYAN = "#00D9FF";
-const PURPLE = "#8B5CFF";
-const GREEN = "#00D97E";
+const CYAN = "var(--jarvis-accent)";
+const PURPLE = "var(--jarvis-accent-2)";
+const GREEN = "var(--jarvis-success)";
 const RED = "#FF4D4D";
 const BORDER = "rgba(255,255,255,0.1)";
 const UI = "'JetBrains Mono', 'Space Mono', monospace";

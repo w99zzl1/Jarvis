@@ -1,6 +1,7 @@
 import os
 import json
-from .registry import Tool, ToolResult, VerificationStatus
+from shared.paths import resolve_path
+from .registry import Tool, ToolResult
 
 
 class ReadTool(Tool):
@@ -23,6 +24,10 @@ class ReadTool(Tool):
                 "type": "string",
                 "description": "The absolute path to the file or directory to read",
             },
+            "path": {
+                "type": "string",
+                "description": "Alias for filePath; models commonly use this name",
+            },
             "offset": {
                 "type": "number",
                 "description": "The line number to start reading from (1-indexed)",
@@ -32,21 +37,33 @@ class ReadTool(Tool):
                 "description": "The maximum number of lines to read (defaults to 2000)",
             },
         },
-        "required": ["filePath"],
+        # Either spelling is valid. Requiring only filePath made models that
+        # used the conventional `path` fail with "No file path provided" over
+        # and over, wasting tool calls on a perfectly valid request.
+        "anyOf": [
+            {"required": ["filePath"]},
+            {"required": ["path"]},
+        ],
     }
 
     def execute(self, args: dict) -> ToolResult:
-        file_path = args.get("filePath", "")
+        file_path = args.get("filePath") or args.get("path") or ""
         offset = args.get("offset", 1)
         limit = args.get("limit", 2000)
 
         if not file_path:
             return ToolResult(status="error", error="No file path provided")
 
-        # Resolve to absolute path
-        abs_path = os.path.abspath(file_path)
+        # Resolve the path; the workspace is a base hint, not a restriction
+        try:
+            abs_path = resolve_path(file_path)
+        except Exception as e:
+            return ToolResult(
+                status="error",
+                error=f"Invalid path: {e}",
+            )
 
-        if not os.path.exists(abs_path):
+        if not abs_path.exists():
             return ToolResult(
                 status="error",
                 error=f"Path does not exist: {abs_path}",
@@ -57,7 +74,7 @@ class ReadTool(Tool):
                 entries = os.listdir(abs_path)
                 return ToolResult(
                     status="success",
-                    data={"directory": abs_path, "entries": entries},
+                    data={"directory": str(abs_path), "entries": entries},
                 )
             except Exception as e:
                 return ToolResult(
@@ -88,16 +105,8 @@ class ReadTool(Tool):
         return ToolResult(
             status="success",
             data={
-                "filePath": abs_path,
+                "filePath": str(abs_path),
                 "content": "\n".join(formatted_lines),
                 "totalLines": len(lines),
             },
         )
-
-    def verify(self, args: dict, result: ToolResult) -> VerificationStatus:
-        if result.status != "success":
-            return VerificationStatus.FAILED
-        exit_code = result.metadata.get("exit_code")
-        if exit_code is not None and exit_code != 0:
-            return VerificationStatus.FAILED
-        return VerificationStatus.SUCCESS

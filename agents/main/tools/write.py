@@ -1,6 +1,7 @@
 import os
 import json
-from .registry import Tool, ToolResult, VerificationStatus
+from shared.paths import resolve_path
+from .registry import Tool, ToolResult
 
 
 class WriteTool(Tool):
@@ -33,8 +34,14 @@ class WriteTool(Tool):
         if not file_path:
             return ToolResult(status="error", error="No file path provided")
 
-        # Resolve to absolute path
-        abs_path = os.path.abspath(file_path)
+        # Resolve the path; the workspace is a base hint, not a restriction
+        try:
+            abs_path = resolve_path(file_path)
+        except Exception as e:
+            return ToolResult(
+                status="error",
+                error=f"Invalid path: {e}",
+            )
 
         try:
             with open(abs_path, "w", encoding="utf-8", errors="replace") as f:
@@ -47,13 +54,5 @@ class WriteTool(Tool):
 
         return ToolResult(
             status="success",
-            data={"filePath": abs_path, "charsWritten": len(content)},
+            data={"filePath": str(abs_path), "charsWritten": len(content)},
         )
-
-    def verify(self, args: dict, result: ToolResult) -> VerificationStatus:
-        if result.status != "success":
-            return VerificationStatus.FAILED
-        exit_code = result.metadata.get("exit_code")
-        if exit_code is not None and exit_code != 0:
-            return VerificationStatus.FAILED
-        return VerificationStatus.SUCCESS

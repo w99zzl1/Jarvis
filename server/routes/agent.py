@@ -49,6 +49,14 @@ def _map_to_sse_event(internal_event: dict) -> dict | None:
             "duration": internal_event.get("duration"),
             "status": internal_event.get("status"),
         }
+    if etype == "tool_output":
+        return {
+            "type": "tool_output",
+            "tool": internal_event.get("tool"),
+            "call_id": internal_event.get("call_id"),
+            "output": internal_event.get("output"),
+            "done": internal_event.get("done", False),
+        }
     if etype == "attempt_started":
         return {
             "type": "progress",
@@ -73,9 +81,17 @@ async def agent_chat_stream(user_input: str, api_keys=None,
             primary_provider=primary_provider,
             api_keys=api_keys,
         )
+    from shared.cancellation import registry as cancel_registry
+
+    # Legacy endpoint: it carries no conversation id, so Stop cannot address it
+    # by id. A client disconnect still cancels the turn through the bus.
+    import uuid
+
+    cid = str(uuid.uuid4())
+    cancel_token = cancel_registry.register(cid)
     # Bounded and lossy for progress ticks: the native scanner's threads push
     # through here while holding the GIL, so this must never block or grow.
-    bus = EventBus()
+    bus = EventBus(on_close=cancel_token.cancel)
 
     def run_agent():
         try:
@@ -88,6 +104,7 @@ async def agent_chat_stream(user_input: str, api_keys=None,
                 config=config,
                 event_sink=bus.push,
             )
+            agent.set_cancel_token(cancel_token)
             result: AgentResult = agent.run(user_input)
             bus.push({
                 "type": "final",
@@ -111,7 +128,15 @@ async def agent_chat_stream(user_input: str, api_keys=None,
                       "tool_calls": 0, "trace_id": None, "model_used": "unknown",
                       "verification_status": None, "verification_reason": None})
         finally:
+            cancel_registry.unregister(cid, cancel_token)
+            from shared import agent_job
+
+            agent_job.cleanup_job(cid)
             bus.push({"type": DONE})
+
+    # Send handshake event first with schema version
+    from server.event_bus import make_handshake_event
+    bus.push(make_handshake_event())
 
     thread = threading.Thread(target=run_agent, daemon=True)
     thread.start()

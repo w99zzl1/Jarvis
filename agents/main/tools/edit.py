@@ -1,6 +1,7 @@
 import os
 import json
-from .registry import Tool, ToolResult, VerificationStatus
+from shared.paths import resolve_path
+from .registry import Tool, ToolResult
 
 
 class EditTool(Tool):
@@ -43,10 +44,16 @@ class EditTool(Tool):
         if not file_path or not old_string:
             return ToolResult(status="error", error="No file path or old string provided")
 
-        # Resolve to absolute path
-        abs_path = os.path.abspath(file_path)
+        # Resolve the path; the workspace is a base hint, not a restriction
+        try:
+            abs_path = resolve_path(file_path)
+        except Exception as e:
+            return ToolResult(
+                status="error",
+                error=f"Invalid path: {e}",
+            )
 
-        if not os.path.exists(abs_path):
+        if not abs_path.exists():
             return ToolResult(
                 status="error",
                 error=f"Path does not exist: {abs_path}",
@@ -84,18 +91,10 @@ class EditTool(Tool):
         return ToolResult(
             status="success",
             data={
-                "filePath": abs_path,
+                "filePath": str(abs_path),
                 "oldString": old_string,
                 "newString": new_string,
                 "replaceAll": replace_all,
                 "charsAffected": len(old_string),
             },
         )
-
-    def verify(self, args: dict, result: ToolResult) -> VerificationStatus:
-        if result.status != "success":
-            return VerificationStatus.FAILED
-        exit_code = result.metadata.get("exit_code")
-        if exit_code is not None and exit_code != 0:
-            return VerificationStatus.FAILED
-        return VerificationStatus.SUCCESS

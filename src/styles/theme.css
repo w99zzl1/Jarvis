@@ -347,6 +347,15 @@ body {
     font-weight: var(--font-weight-normal);
     line-height: 1.5;
   }
+
+  /* AETHER surfaces follow the design draft, whose buttons inherit the
+     surrounding font (Tailwind preflight applies `font: inherit`). The base
+     rules above pin buttons to 16px/medium — correct for the dashboard, wrong
+     for the AETHER window and its dialogs. Utilities still win, so any button
+     that sets its own size/weight is unaffected. */
+  [data-aether] button {
+    font: inherit;
+  }
 }
 
 /* ==========================================================

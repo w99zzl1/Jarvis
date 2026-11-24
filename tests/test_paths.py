@@ -5,8 +5,8 @@ Every writable runtime file must resolve under the per-user data directory
 (``%APPDATA%\\com.jarvis.assistant`` by default) and never next to the source
 tree: a packaged app lives in a read-only directory.
 
-The agent workspace is a separate thing and must default to
-``Documents\\Jarvis``, never to the installation directory.
+The agent workspace is a user-supplied hint for where "the project" is. It
+has no default; leaving it unset must not create or assume any folder.
 
 Run:
     python tests/test_paths.py
@@ -16,7 +16,6 @@ No pytest, no network. Everything is written to temporary directories.
 
 import json
 import os
-import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -134,40 +133,14 @@ def test_workspace(tmp: Path):
 
     with env(JARVIS_DATA_DIR=data, JARVIS_WORKDIR=explicit):
         check("workspace_dir honours JARVIS_WORKDIR", paths.workspace_dir() == explicit, str(paths.workspace_dir()))
-        check("workspace_dir creates JARVIS_WORKDIR", explicit.is_dir())
+        check("workspace_dir does not create the folder", not explicit.exists())
 
     with env(JARVIS_DATA_DIR=data, JARVIS_WORKDIR=None):
+        check("workspace_dir is None without user config", paths.workspace_dir() is None, str(paths.workspace_dir()))
         paths.api_keys_file().write_text(json.dumps({"workdir": str(saved)}), encoding="utf-8")
-        check("workspace_dir falls back to the saved workdir", paths.workspace_dir() == saved, str(paths.workspace_dir()))
+        check("workspace_dir uses the saved workdir", paths.workspace_dir() == saved, str(paths.workspace_dir()))
+        check("workspace_dir does not create the saved workdir", not saved.exists())
         paths.api_keys_file().unlink()
-
-    # Default: no env override, no saved config -> Documents\Jarvis under the
-    # user profile. Run in a subprocess with a fake profile so the real
-    # Documents folder is never touched.
-    home = tmp / "home"
-    home.mkdir()
-    appdata = tmp / "appdata-ws"
-    appdata.mkdir()
-    child_env = {k: v for k, v in os.environ.items() if k not in ("JARVIS_DATA_DIR", "JARVIS_WORKDIR")}
-    child_env["USERPROFILE"] = str(home)
-    child_env["APPDATA"] = str(appdata)
-    proc = subprocess.run(
-        [sys.executable, "-c", "from shared import paths; print(paths.workspace_dir())"],
-        cwd=str(ROOT),
-        env=child_env,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    out = proc.stdout.strip().splitlines()
-    got = Path(out[-1]) if proc.returncode == 0 and out else Path("<failed>")
-    expected = home / "Documents" / paths.DEFAULT_WORKSPACE_NAME
-    check(
-        "workspace_dir defaults to Documents\\Jarvis",
-        got.resolve() == expected.resolve(),
-        f"{got} (stderr: {proc.stderr.strip()[:200]})",
-    )
 
 
 def test_contract_with_tauri():

@@ -22,6 +22,10 @@ never dropped for *terminal* events (tool start/finish, final, errors), and a
 Future work will move this stream onto native Tauri events emitted straight from
 Rust. The producer side does not care which transport it writes to, so that swap
 touches the routes and the frontend only.
+
+Event Schema Versioning:
+- v1: Original events (no version field)
+- v2: Added `event_schema_version` to handshake and all events
 """
 from __future__ import annotations
 
@@ -34,6 +38,9 @@ from collections import deque
 from collections.abc import Callable, Iterator
 
 log = logging.getLogger("server.events")
+
+# Event schema version - increment when making breaking changes to event format
+EVENT_SCHEMA_VERSION = 2
 
 # Types that are safe to lose: a newer event of the same kind supersedes them.
 LOSSY = frozenset({"tool_progress", "stream", "token", "thought"})
@@ -52,15 +59,55 @@ HEARTBEAT_SECONDS = 8.0
 POLL_SECONDS = 0.01
 
 
+def _json_default(obj):
+    """Last-resort encoder for a value `json` cannot serialize.
+
+    Events come from many producers - the agent thread, tool code, the native
+    scanner's worker threads. One non-JSON value in a single field must never
+    abort the whole response and leave the client without its `final` frame,
+    which is exactly what a bare `json.dumps` did: a `pathlib.Path` in a tool
+    result raised `TypeError` inside the generator and killed the stream.
+
+    Unknown objects degrade to their string form - the same policy FastAPI's
+    `jsonable_encoder` and the agent's own `json.dumps(..., default=str)` use -
+    and the type is logged so the real producer bug stays visible rather than
+    being silently swallowed.
+    """
+    log.warning("[events] non-JSON value in event payload: %s", type(obj).__name__)
+    return str(obj)
+
+
+def make_handshake_event() -> dict:
+    """Create the initial handshake event with schema version."""
+    return {
+        "type": "handshake",
+        "event_schema_version": EVENT_SCHEMA_VERSION,
+        "timestamp": time.time(),
+    }
+
+
+def add_schema_version(event: dict) -> dict:
+    """Add schema version to event if not present."""
+    if "event_schema_version" not in event:
+        event = dict(event)  # copy
+        event["event_schema_version"] = EVENT_SCHEMA_VERSION
+    return event
+
+
 class EventBus:
     """Thread-safe bounded queue with a lossy/terminal split."""
 
-    def __init__(self, capacity: int = DEFAULT_CAPACITY):
+    def __init__(self, capacity: int = DEFAULT_CAPACITY, on_close=None):
         self._capacity = max(8, capacity)
         self._items: deque[dict] = deque()
         self._lock = threading.Lock()
         self._not_empty = threading.Condition(self._lock)
         self._closed = False
+        # Fired exactly once, on the first `close()`. Routes use it to cancel
+        # the agent turn when the client goes away, so work stops for a socket
+        # nobody is reading instead of running to completion against a dead
+        # connection.
+        self._on_close = on_close
         self.dropped = 0
         self.overflow = 0
         self.pushed = 0
@@ -101,8 +148,14 @@ class EventBus:
     def close(self) -> None:
         """Tell the producer nobody is listening any more."""
         with self._lock:
+            first_close = not self._closed
             self._closed = True
             self._not_empty.notify_all()
+        if first_close and self._on_close is not None:
+            try:
+                self._on_close()
+            except Exception:
+                log.exception("[events] on_close callback failed")
 
     @property
     def closed(self) -> bool:
@@ -167,9 +220,20 @@ async def sse_stream(
     worker blocked forever per stream, and they all share the default executor.
     A worker is now held for at most `poll`, so a disconnect costs nothing.
 
-    `mapper` turns an internal event into an SSE payload, or None to skip it.
-    `final` is passed through untouched - it is the response body the frontend
-    resolves the request with.
+    `mapper` turns an internal agent event into an SSE payload, or None to skip
+    it. Transport-level events are handled here, once, so every streaming mode
+    behaves the same instead of relying on each route's mapper to remember them:
+
+    * `handshake` is forwarded directly - no agent mapper needs to translate a
+      schema-version announcement, and all three previously dropped it.
+    * `internal` events are filtered here rather than in whichever mapper
+      remembered to check the flag.
+    * `final` is passed through and ends the response - it is the body the
+      frontend resolves the request with.
+
+    Every outgoing payload gets the schema version through `add_schema_version`:
+    that is what the v2 contract in this module's docstring promises, and it
+    makes the previously unused helper the single source of truth.
     """
     loop = asyncio.get_running_loop()
     last_beat = time.monotonic()
@@ -179,13 +243,29 @@ async def sse_stream(
                 etype = event.get("type")
                 if etype == DONE:
                     return
+                if event.get("internal"):
+                    continue
                 if etype == "final":
-                    yield f"data: {json.dumps(event)}\n\n"
+                    yield f"data: {json.dumps(add_schema_version(event), default=_json_default)}\n\n"
                     return
-                sse = mapper(event)
-                if sse:
-                    last_beat = time.monotonic()
-                    yield f"data: {json.dumps(sse)}\n\n"
+                if etype == "handshake":
+                    sse = event
+                else:
+                    try:
+                        sse = mapper(event)
+                    except Exception:
+                        # Same contract as `_json_default`: one bad event must not
+                        # abort the response. If the mapper raised here the client
+                        # would never receive its `final` frame and would report
+                        # "Stream did not produce a final event".
+                        log.exception(
+                            "[events] mapper failed for event type=%s", etype
+                        )
+                        continue
+                    if not sse:
+                        continue
+                last_beat = time.monotonic()
+                yield f"data: {json.dumps(add_schema_version(sse), default=_json_default)}\n\n"
             if time.monotonic() - last_beat >= heartbeat:
                 # A comment frame keeps proxies and EventSource from calling the
                 # connection dead during a 29-second silent scan.

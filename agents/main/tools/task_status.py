@@ -2,7 +2,7 @@
 Task status tool — allows LLM to query background task status.
 """
 import time
-from .registry import Tool, ToolResult, VerificationStatus
+from .registry import Tool, ToolResult
 
 
 class TaskStatusTool(Tool):
@@ -66,10 +66,6 @@ class TaskStatusTool(Tool):
                 metadata={"execution_time": time.time() - start}
             )
 
-    def verify(self, args: dict, result: ToolResult) -> VerificationStatus:
-        if result.status == "success" and result.data:
-            return VerificationStatus.SUCCESS
-        return VerificationStatus.FAILED
 
     @staticmethod
     def _get_manager():

@@ -5,19 +5,40 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tauri::webview::{PermissionKind, PermissionResponse};
 use tauri::{Emitter, Manager, State};
+use sha2::{Digest, Sha256};
 
 const ASSISTANT_W: f64 = 1152.0;
 const ASSISTANT_H: f64 = 683.0;
 const MAIN_W: f64 = 427.0;
 const DEFAULT_GAP: f64 = 14.0;
 const DEFAULT_OPACITY: f64 = 0.72;
+/// Built-in "current" chat/voice palette. Any saved value other than `onyx`
+/// falls back to this one so a stale/foreign file can never break the UI.
+const DEFAULT_THEME: &str = "aether";
+const THEME_ONYX: &str = "onyx";
 const BACKEND_PORT: u16 = 8765;
 /// Must match `bundle.identifier` in tauri.conf.json: Tauri resolves
 /// `app_config_dir()` to `%APPDATA%\<bundle identifier>` on Windows.
 const APP_DIR_NAME: &str = "com.jarvis.assistant";
+/// Token TTL in seconds (24 hours)
+const TOKEN_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+/// Lock a UI-state mutex without panicking the whole app.
+///
+/// `.unwrap()` here killed the Tauri process if another command panicked while
+/// holding the lock (poisoned state). These guards only hold copies of plain
+/// settings, so recovering the inner value is safe and strictly better than
+/// losing the whole window.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        eprintln!("[state] recovered a poisoned mutex; using its last value");
+        poisoned.into_inner()
+    })
+}
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct ModelSpec {
@@ -41,6 +62,13 @@ struct AppConfig {
     // server filters them out of the prompt and the tool schema per request.
     #[serde(default)]
     disabled_tools: Vec<String>,
+    // Audio settings are read by the Python backend from the same config file.
+    // Keep them as raw JSON so a frontend save can never erase settings written
+    // by /settings/stt or /settings/tts.
+    #[serde(default)]
+    stt: Option<serde_json::Value>,
+    #[serde(default)]
+    tts: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -58,6 +86,7 @@ struct BackendStatus {
 struct AppState {
     gap: Mutex<f64>,
     opacity: Mutex<f64>,
+    theme: Mutex<String>,
     assistant_visible: Mutex<bool>,
     settings_visible: Mutex<bool>,
     /// Was the settings window open before the assistant took over the screen?
@@ -98,6 +127,14 @@ fn opacity_path(app: &tauri::AppHandle) -> PathBuf {
         .app_config_dir()
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
     dir.join("opacity.json")
+}
+
+fn theme_path(app: &tauri::AppHandle) -> PathBuf {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+    dir.join("theme.json")
 }
 
 fn load_config(app: &tauri::AppHandle) -> AppConfig {
@@ -155,6 +192,29 @@ fn save_opacity(app: &tauri::AppHandle, opacity: f64) {
     let _ = std::fs::write(&p, format!("{}", opacity));
 }
 
+fn normalize_theme(raw: &str) -> String {
+    match raw.trim() {
+        THEME_ONYX => THEME_ONYX.to_string(),
+        _ => DEFAULT_THEME.to_string(),
+    }
+}
+
+fn load_theme(app: &tauri::AppHandle) -> String {
+    let p = theme_path(app);
+    std::fs::read_to_string(&p)
+        .ok()
+        .map(|s| normalize_theme(&s))
+        .unwrap_or_else(|| DEFAULT_THEME.to_string())
+}
+
+fn save_theme(app: &tauri::AppHandle, theme: &str) {
+    let p = theme_path(app);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&p, theme);
+}
+
 /// Per-user directory the Python backend writes to. Mirrors
 /// `app_config_dir()` so both sides of the app agree on one location.
 fn data_dir() -> PathBuf {
@@ -171,6 +231,71 @@ fn data_dir() -> PathBuf {
     }
 }
 
+/// Token storage file path (hash + expiry)
+fn token_file_path() -> PathBuf {
+    data_dir().join("api_token.json")
+}
+
+/// Load stored token hash and expiry from disk
+fn load_token_info() -> Option<(String, u64)> {
+    let path = token_file_path();
+    if !path.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let hash = value.get("hash")?.as_str()?.to_string();
+    let expiry = value.get("expiry")?.as_u64()?;
+    Some((hash, expiry))
+}
+
+/// Save token hash and expiry to disk atomically
+fn save_token_info(token: &str, expiry: u64) -> Result<(), String> {
+    // Hash token with SHA256 to match Python's hashlib.sha256
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+
+    let value = serde_json::json!({
+        "hash": hash,
+        "expiry": expiry
+    });
+
+    let path = token_file_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let content = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content).map_err(|e| e.to_string())?;
+    std::fs::rename(tmp, path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Check if stored token is expired
+fn is_token_expired() -> bool {
+    if let Some((_, expiry)) = load_token_info() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        return now > expiry;
+    }
+    false
+}
+
+/// Generate a new token with expiry and save to disk
+fn generate_and_save_token() -> (String, u64) {
+    let token = generate_api_token();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expiry = now + TOKEN_TTL_SECONDS;
+    let _ = save_token_info(&token, expiry);
+    (token, expiry)
+}
+
 /// Repository root, but only while running from source (dev mode).
 fn find_project_root() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
@@ -181,19 +306,6 @@ fn find_project_root() -> Option<PathBuf> {
     candidates
         .into_iter()
         .find(|p| p.join("server").join("main.py").is_file())
-}
-
-fn documents_dir() -> PathBuf {
-    std::env::var("USERPROFILE")
-        .map(|home| PathBuf::from(home).join("Documents"))
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
-}
-
-/// Agent working folder. Dev runs inside the repo; an installed build must
-/// never use the (read-only) install directory, so it falls back to
-/// `Documents\Jarvis`.
-fn default_workdir() -> PathBuf {
-    find_project_root().unwrap_or_else(|| documents_dir().join("Jarvis"))
 }
 
 fn load_config_at(dir: &Path) -> AppConfig {
@@ -442,10 +554,21 @@ fn process_details(pid: u32) -> String {
         .unwrap_or_default()
 }
 
-/// Does this image name + command line belong to a Jarvis backend?
-fn is_jarvis_backend(details: &str) -> bool {
-    details.contains("python")
-        && (details.contains("server\\main.py") || details.contains("server/main.py"))
+/// Does this image name + command line belong to *this* Jarvis backend?
+///
+/// Checking for a generic `server/main.py` was too loose: any unrelated Python
+/// program with that filename on its command line could be killed. The caller
+/// passes the exact `server_py` paths it is about to launch, so only a process
+/// running one of those paths is considered ours.
+fn is_jarvis_backend(details: &str, expected: &[PathBuf]) -> bool {
+    if !details.contains("python") {
+        return false;
+    }
+    let command_line = details.replace('/', "\\");
+    expected.iter().any(|path| {
+        let needle = path.to_string_lossy().to_lowercase().replace('/', "\\");
+        !needle.is_empty() && command_line.contains(&needle)
+    })
 }
 
 /// Kill a python backend left behind by a previous run.
@@ -454,10 +577,10 @@ fn is_jarvis_backend(details: &str) -> bool {
 /// its destructors, so the python child survives and keeps the port. Only a
 /// process that is recognisably our backend is ever touched - if something else
 /// owns the port we only warn about it.
-fn stop_stale_backend(port: u16) {
+fn stop_stale_backend(port: u16, expected: &[PathBuf]) {
     for pid in listening_pids(port) {
         let details = process_details(pid);
-        if !is_jarvis_backend(&details) {
+        if !is_jarvis_backend(&details, expected) {
             eprintln!(
                 "[backend] port {} is owned by pid {} ({}) - leaving it alone",
                 port,
@@ -562,13 +685,15 @@ fn generate_api_token() -> String {
 
 #[cfg(not(windows))]
 fn generate_api_token() -> String {
-    // Not a supported target; keep the code compiling for local checks.
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    hex(&nanos.to_le_bytes())
+    // Not a supported release target, but the token must never be guessable:
+    // time-derived bytes would defeat the whole local API protection. Use the
+    // OS CSPRNG and fail loudly if it is unavailable, like the Windows branch.
+    use std::fs::File;
+    let mut bytes = [0u8; 32];
+    File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .expect("/dev/urandom unavailable; refusing to create a guessable API token");
+    hex(&bytes)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -584,7 +709,7 @@ fn hex(bytes: &[u8]) -> String {
 fn start_python_backend(
     commands: &[BackendCommand],
     data_dir: &Path,
-    workdir: &Path,
+    workdir: Option<&Path>,
     api_token: &str,
 ) -> (Option<Child>, BackendStatus) {
     let mode = commands
@@ -598,7 +723,9 @@ fn start_python_backend(
         // python child alive on the port. We take the port back, but only from
         // a process we can identify as *our* backend: stop_stale_backend checks
         // the command line before killing anything.
-        stop_stale_backend(BACKEND_PORT);
+        // Only the exact scripts this build would launch may be terminated.
+        let expected: Vec<PathBuf> = commands.iter().map(|c| c.server_py.clone()).collect();
+        stop_stale_backend(BACKEND_PORT, &expected);
 
         if port_is_open(BACKEND_PORT) {
             let message = format!(
@@ -641,11 +768,15 @@ fn start_python_backend(
         cmd.arg(&spec.server_py)
             .current_dir(&spec.cwd)
             .env("JARVIS_DATA_DIR", data_dir)
-            .env("JARVIS_WORKDIR", workdir)
             .env("JARVIS_API_TOKEN", api_token)
             .env("PYTHONUTF8", "1")
             .env("PYTHONIOENCODING", "utf-8")
             .stdin(Stdio::null());
+
+        // The workspace is optional: only pass it when the user picked one.
+        if let Some(dir) = workdir {
+            cmd.env("JARVIS_WORKDIR", dir);
+        }
 
         if let Some(file) = &log {
             if let Ok(copy) = file.try_clone() {
@@ -770,13 +901,13 @@ fn move_group(app: tauri::AppHandle, dx: f64, dy: f64) {
 
 #[tauri::command]
 fn show_assistant(app: tauri::AppHandle, state: State<'_, AppState>) {
-    *state.assistant_visible.lock().unwrap() = true;
+    *lock(&state.assistant_visible) = true;
 
     // Console mode: the assistant is the whole picture now, so the small
     // windows step aside instead of fighting it for screen space.
-    let settings_was_open = *state.settings_visible.lock().unwrap();
-    *state.settings_before_console.lock().unwrap() = settings_was_open;
-    *state.settings_visible.lock().unwrap() = false;
+    let settings_was_open = *lock(&state.settings_visible);
+    *lock(&state.settings_before_console) = settings_was_open;
+    *lock(&state.settings_visible) = false;
 
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.hide();
@@ -803,14 +934,14 @@ fn show_assistant(app: tauri::AppHandle, state: State<'_, AppState>) {
 /// back on screen and re-snapped to each other.
 #[tauri::command]
 fn restore_desktop(app: tauri::AppHandle, state: State<'_, AppState>) {
-    *state.assistant_visible.lock().unwrap() = false;
+    *lock(&state.assistant_visible) = false;
 
     if let Some(assistant) = app.get_webview_window("assistant") {
         let _ = assistant.hide();
     }
 
-    let settings_back = *state.settings_before_console.lock().unwrap();
-    *state.settings_visible.lock().unwrap() = settings_back;
+    let settings_back = *lock(&state.settings_before_console);
+    *lock(&state.settings_visible) = settings_back;
 
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.show();
@@ -822,7 +953,7 @@ fn restore_desktop(app: tauri::AppHandle, state: State<'_, AppState>) {
             app.get_webview_window("main"),
             app.get_webview_window("settings"),
         ) {
-            let gap = *state.gap.lock().unwrap();
+            let gap = *lock(&state.gap);
             if let (Ok(pos), Ok(scale)) = (main.outer_position(), main.scale_factor()) {
                 let main_x = (pos.x as f64) / scale;
                 let main_y = (pos.y as f64) / scale;
@@ -843,14 +974,21 @@ fn hide_assistant(app: tauri::AppHandle, state: State<'_, AppState>) {
     restore_desktop(app, state);
 }
 
+/// Quit the whole application. The main window's close button calls this so the
+/// hidden assistant/settings windows cannot keep the process alive.
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 #[tauri::command]
 fn show_settings(app: tauri::AppHandle, state: State<'_, AppState>) {
-    *state.settings_visible.lock().unwrap() = true;
+    *lock(&state.settings_visible) = true;
     if let (Some(main), Some(settings)) = (
         app.get_webview_window("main"),
         app.get_webview_window("settings"),
     ) {
-        let gap = *state.gap.lock().unwrap();
+        let gap = *lock(&state.gap);
         let scale = main.scale_factor().unwrap_or(1.0);
         let main_w = window_width(&app, "main", MAIN_W);
         if let Ok(pos) = main.outer_position() {
@@ -872,7 +1010,7 @@ fn spawn_console_watchdog(app: tauri::AppHandle) {
 
         let assistant_visible = app
             .try_state::<AppState>()
-            .map(|s| *s.assistant_visible.lock().unwrap())
+            .map(|s| *lock(&s.assistant_visible))
             .unwrap_or(false);
         if !assistant_visible {
             continue;
@@ -895,7 +1033,7 @@ fn spawn_console_watchdog(app: tauri::AppHandle) {
 
 #[tauri::command]
 fn hide_settings(app: tauri::AppHandle, state: State<'_, AppState>) {
-    *state.settings_visible.lock().unwrap() = false;
+    *lock(&state.settings_visible) = false;
     if let Some(settings) = app.get_webview_window("settings") {
         let _ = settings.hide();
     }
@@ -903,12 +1041,12 @@ fn hide_settings(app: tauri::AppHandle, state: State<'_, AppState>) {
 
 #[tauri::command]
 fn get_gap(state: State<'_, AppState>) -> f64 {
-    *state.gap.lock().unwrap()
+    *lock(&state.gap)
 }
 
 #[tauri::command]
 fn set_gap(app: tauri::AppHandle, state: State<'_, AppState>, gap: f64) {
-    *state.gap.lock().unwrap() = gap;
+    *lock(&state.gap) = gap;
     save_gap(&app, gap);
     if let Some(main) = app.get_webview_window("main") {
         let scale = main.scale_factor().unwrap_or(1.0);
@@ -937,20 +1075,33 @@ fn set_gap(app: tauri::AppHandle, state: State<'_, AppState>, gap: f64) {
 
 #[tauri::command]
 fn get_opacity(state: State<'_, AppState>) -> f64 {
-    *state.opacity.lock().unwrap()
+    *lock(&state.opacity)
 }
 
 #[tauri::command]
 fn set_opacity(app: tauri::AppHandle, state: State<'_, AppState>, opacity: f64) {
     let opacity = opacity.clamp(0.1, 1.0);
-    *state.opacity.lock().unwrap() = opacity;
+    *lock(&state.opacity) = opacity;
     save_opacity(&app, opacity);
     let _ = app.emit("opacity-changed", opacity);
 }
 
 #[tauri::command]
+fn get_theme(state: State<'_, AppState>) -> String {
+    lock(&state.theme).clone()
+}
+
+#[tauri::command]
+fn set_theme(app: tauri::AppHandle, state: State<'_, AppState>, theme: String) {
+    let theme = normalize_theme(&theme);
+    *lock(&state.theme) = theme.clone();
+    save_theme(&app, &theme);
+    let _ = app.emit("theme-changed", theme);
+}
+
+#[tauri::command]
 fn get_config(state: State<'_, AppState>) -> AppConfig {
-    state.config.lock().unwrap().clone()
+    lock(&state.config).clone()
 }
 
 #[tauri::command]
@@ -968,18 +1119,26 @@ fn set_config(app: tauri::AppHandle, state: State<'_, AppState>, new_config: App
     keys.retain(|k, v| !k.trim().is_empty() && !v.trim().is_empty());
     merged.api_keys = keys;
 
-    let mut config = state.config.lock().unwrap();
+    // STT/TTS settings may be written by the Python API rather than the UI.
+    // An AppConfig payload that omits them must not delete them on disk.
+    if merged.stt.is_none() {
+        merged.stt = on_disk.stt.clone();
+    }
+    if merged.tts.is_none() {
+        merged.tts = on_disk.tts.clone();
+    }
+
+    let mut config = lock(&state.config);
     *config = merged.clone();
     save_config(&app, &merged);
 }
 
 #[tauri::command]
 fn get_workdir(app: tauri::AppHandle) -> String {
-    let cfg = load_config(&app);
-    if let Some(w) = cfg.workdir {
-        return w;
-    }
-    default_workdir().display().to_string()
+    // Empty string means the user has not chosen a workspace. There is no
+    // default: the UI shows a "workspace" placeholder and the agent simply
+    // works with absolute paths.
+    load_config(&app).workdir.unwrap_or_default()
 }
 
 #[tauri::command]
@@ -1020,80 +1179,6 @@ fn api_token(state: State<'_, AppState>) -> String {
     state.api_token.clone()
 }
 
-/// Start recording microphone audio. The backend owns the recording session;
-/// the frontend only triggers start/stop via these commands.
-#[tauri::command]
-fn audio_record_start(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<String, String> {
-    use std::collections::HashMap;
-    let session_id = format!("session-{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0));
-    // Store session id so audio_chunk knows which buffer to write to.
-    if let Ok(mut guard) = state.config.lock() {
-        // We reuse config map as a stash for session id; simpler than adding
-        // a new state field just for this.
-        guard.api_keys.insert("__stt_session__".to_string(), session_id.clone());
-    }
-    // Tell the WebView to start capturing microphone audio. Chunks flow back
-    // via the `audio_chunk` Tauri command; the backend (Python) does STT.
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.emit("audio:start-capture", serde_json::json!({"session_id": session_id}));
-    }
-    Ok(session_id)
-}
-
-/// Receive an audio chunk from the frontend and forward it to the Python
-/// STT backend for accumulation.
-#[tauri::command]
-async fn audio_chunk(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    session_id: String,
-    data: String, // base64-encoded WebM/Opus chunk
-) -> Result<String, String> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post("http://127.0.0.1:8765/stt/stream-chunk")
-        .json(&serde_json::json!({"session_id": session_id, "chunk": data}))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("STT backend unreachable: {e}"))?;
-    let _: serde_json::Value = resp.json().await.map_err(|e| format!("STT chunk parse error: {e}"))?;
-    Ok("ok".to_string())
-}
-
-/// Stop recording and return transcribed text via Python STT backend.
-#[tauri::command]
-async fn audio_record_stop(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<String, String> {
-    // Stop the recorder on the frontend side
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.emit("audio:stop-capture", serde_json::json!({}));
-    }
-    // Read the session id we stashed on start.
-    let session_id = state.config.lock().unwrap()
-        .api_keys.get("__stt_session__")
-        .cloned()
-        .unwrap_or_else(|| "default".to_string());
-    // Ask Python backend to transcribe accumulated audio and return text
-    let client = reqwest::Client::new();
-    let resp = client
-        .post("http://127.0.0.1:8765/stt/finalize")
-        .json(&serde_json::json!({"session_id": session_id}))
-        .timeout(std::time::Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|e| format!("STT backend unreachable: {e}"))?;
-    let text: serde_json::Value = resp.json().await.map_err(|e| format!("STT response parse error: {e}"))?;
-    let text_str = text.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    // Clean up session
-    if let Ok(mut guard) = state.config.lock() {
-        guard.api_keys.remove("__stt_session__");
-    }
-    Ok(text_str)
-}
-
 fn main() {
     tauri::Builder::default()
         // Must be registered before other plugins: the second instance should
@@ -1109,15 +1194,34 @@ fn main() {
         .setup(|app| {
             let data = data_dir();
             let _ = std::fs::create_dir_all(&data);
-            let workdir = load_config_at(&data)
-                .workdir
-                .map(PathBuf::from)
-                .unwrap_or_else(default_workdir);
-            let api_token = generate_api_token();
+            let workdir = load_config_at(&data).workdir.map(PathBuf::from);
+
+            // Token rotation: check if stored token is expired, rotate if needed
+            let api_token = if is_token_expired() {
+                eprintln!("[security] Stored token expired, generating new token");
+                let (token, expiry) = generate_and_save_token();
+                eprintln!("[security] New token generated, expires at {}", expiry);
+                token
+            } else if let Some((_, expiry)) = load_token_info() {
+                // Token exists and not expired, but we need to generate a new one for this session
+                // since the Python backend expects a fresh token per launch
+                // Actually, we should use the stored token to maintain continuity
+                // But the token is per-launch... let's generate new but save expiry
+                eprintln!("[security] Generating new session token (previous expiry: {})", expiry);
+                let (token, new_expiry) = generate_and_save_token();
+                eprintln!("[security] New token generated, expires at {}", new_expiry);
+                token
+            } else {
+                // No stored token, generate new
+                eprintln!("[security] No stored token, generating new token");
+                let (token, expiry) = generate_and_save_token();
+                eprintln!("[security] New token generated, expires at {}", expiry);
+                token
+            };
 
             let (child, status) = match resolve_backend(app.handle()) {
                 Ok(commands) => {
-                    start_python_backend(&commands, &data, &workdir, &api_token)
+                    start_python_backend(&commands, &data, workdir.as_deref(), &api_token)
                 }
                 Err(message) => {
                     eprintln!("[backend] {}", message);
@@ -1137,10 +1241,12 @@ fn main() {
             let config = load_config(app.handle());
             let gap = load_gap(app.handle());
             let opacity = load_opacity(app.handle());
+            let theme = load_theme(app.handle());
 
             app.manage(AppState {
                 gap: Mutex::new(gap),
                 opacity: Mutex::new(opacity),
+                theme: Mutex::new(theme.clone()),
                 assistant_visible: Mutex::new(false),
                 settings_visible: Mutex::new(false),
                 settings_before_console: Mutex::new(false),
@@ -1152,9 +1258,11 @@ fn main() {
             // Started after AppState exists so the first status update lands.
             spawn_backend_watchdog(app.handle().clone(), status);
 
+            // Apply both settings before React paints, so every window starts
+            // in the saved palette instead of flashing the default one.
             let _js = format!(
-                "document.querySelectorAll('[data-panel-bg]').forEach(function(e){{e.style.background='rgba(1, 4, 8, {})}});",
-                opacity
+                "document.documentElement.dataset.theme='{}';document.documentElement.style.setProperty('--jarvis-opacity','{}');document.querySelectorAll('[data-panel-bg]').forEach(function(e){{e.style.background='rgba(var(--jarvis-panel-rgb), {})'}});",
+                theme, opacity, opacity
             );
             
             for label in ["main", "assistant", "settings"] {
@@ -1189,26 +1297,35 @@ fn main() {
         })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        // WebView2 has no visible permission bubble in a borderless Tauri
+        // window. Without an explicit handler, `getUserMedia` for the
+        // microphone is denied (or silently defaulted), so no audio was ever
+        // captured and no tray mic indicator appeared. The webview only ever
+        // loads our own app origin, so approving microphone here is safe.
+        .on_permission_request(|_webview, kind| match kind {
+            PermissionKind::Microphone => PermissionResponse::Allow,
+            _ => PermissionResponse::Default,
+        })
         .invoke_handler(tauri::generate_handler![
             move_group,
             show_assistant,
             hide_assistant,
             restore_desktop,
+            quit_app,
             show_settings,
             hide_settings,
             get_gap,
             set_gap,
             get_opacity,
             set_opacity,
+            get_theme,
+            set_theme,
             get_config,
             set_config,
             get_workdir,
             set_workdir,
             backend_status,
             api_token,
-            audio_record_start,
-            audio_chunk,
-            audio_record_stop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1302,12 +1419,19 @@ mod tests {
     fn only_a_jarvis_server_main_py_counts_as_a_stale_backend() {
         let bundled = "python.exe\n\"c:\\users\\me\\appdata\\local\\jarvis\\backend\\python\\python.exe\" \
                        \"c:\\users\\me\\appdata\\local\\jarvis\\backend\\app\\server\\main.py\"";
-        assert!(is_jarvis_backend(bundled));
-        assert!(is_jarvis_backend("python\nc:/repo/jarvis/server/main.py"));
+        let bundled_path = PathBuf::from(r"c:\users\me\appdata\local\jarvis\backend\app\server\main.py");
+        let dev_path = PathBuf::from(r"C:\repo\jarvis\server\main.py");
+        let expected = [bundled_path, dev_path.clone()];
+
+        assert!(is_jarvis_backend(bundled, &expected));
+        assert!(is_jarvis_backend("python\nc:/repo/jarvis/server/main.py", &expected));
 
         // A python that is not our backend, or our path in something else.
-        assert!(!is_jarvis_backend("python.exe\nc:\\tools\\http_server.py"));
-        assert!(!is_jarvis_backend("node.exe\nsomething server\\main.py"));
-        assert!(!is_jarvis_backend(""));
+        assert!(!is_jarvis_backend("python.exe\nc:\\tools\\http_server.py", &expected));
+        assert!(!is_jarvis_backend(
+            "node.exe\n\"c:\\repo\\jarvis\\server\\main.py\"",
+            &expected,
+        ));
+        assert!(!is_jarvis_backend("", &expected));
     }
 }

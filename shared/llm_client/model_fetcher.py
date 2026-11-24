@@ -198,7 +198,7 @@ def check_connected_providers_and_fetch_models(api_keys_dict: dict | None = None
         if o_key:
             keys["openai"] = o_key
     if "nim" not in keys:
-        n_key = os.environ.get("NIM_API_KEY")
+        n_key = getattr(config_main, "NIM_API_KEY", None) or os.environ.get("NIM_API_KEY")
         if n_key:
             keys["nim"] = n_key
     if "openrouter" not in keys:

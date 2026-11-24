@@ -15,19 +15,8 @@ from agents.main.agent import AgentResult
 from server.event_bus import DONE, EventBus, sse_stream
 from shared.execution_plan import ExecutionEvent, EventType
 from server.conversations import store as conv_store
-from shared import agent_job
 
 log = logging.getLogger("server")
-
-
-def _looks_like_progress(event: dict) -> bool:
-    """A bare scanner sample: counters, no envelope.
-
-    `percent`/`nodes` together are specific enough that no other internal event
-    can be mistaken for one.
-    """
-    return ("percent" in event and "nodes" in event
-            and event.get("type") in (None, ""))
 
 
 def _map_to_sse_event(internal_event: dict) -> dict | None:
@@ -80,13 +69,9 @@ def _map_to_sse_event(internal_event: dict) -> dict | None:
             "call_id": internal_event.get("call_id"),
         }
 
-    if etype == "tool_progress" or _looks_like_progress(internal_event):
-        # Streamed from the native scanner's worker threads while a long scan
-        # runs. The UI shows it as a progress bar; nothing here waits on it.
-        #
-        # The shape is also recognised without a `type`, so a raw sample straight
-        # from Rust still streams - which is what the planned move to native
-        # Tauri events will send.
+    if etype == "tool_progress":
+        # Streamed from a long-running tool while work continues. Producers
+        # always attach the event type; no field-shape guessing is needed.
         return {
             "type": "tool_progress",
             "tool": internal_event.get("tool_name") or internal_event.get("tool"),
@@ -100,14 +85,25 @@ def _map_to_sse_event(internal_event: dict) -> dict | None:
         }
 
     if etype in ("tool_finished", "tool_completed"):
+        # The unified engine emits `result`; older producers used `tool_result`.
+        # Accept both here - the main chat mapper already does - otherwise the
+        # code stream closes every tool row with an empty result.
         return {
             "type": "tool_completed",
             "tool": internal_event.get("tool_name") or internal_event.get("tool"),
             "status": internal_event.get("status"),
             "duration": internal_event.get("duration"),
-            "result": internal_event.get("tool_result"),
+            "result": internal_event.get("result") or internal_event.get("tool_result"),
             "task_id": internal_event.get("task_id"),
             "call_id": internal_event.get("call_id"),
+        }
+    if etype == "tool_output":
+        return {
+            "type": "tool_output",
+            "tool": internal_event.get("tool_name") or internal_event.get("tool"),
+            "call_id": internal_event.get("call_id"),
+            "output": internal_event.get("output"),
+            "done": internal_event.get("done", False),
         }
 
     if etype == "execution_error":
@@ -160,7 +156,10 @@ def _map_to_sse_event(internal_event: dict) -> dict | None:
 def _project_root() -> str:
     from shared import paths
 
-    return str(paths.workspace_dir())
+    # The code agent needs a concrete project to run in. Use the user's
+    # workspace when they picked one, otherwise the process cwd (the repo in
+    # dev mode). This is only a default; tools accept any absolute path.
+    return str(paths.workspace_dir() or Path.cwd())
 
 
 def list_code_tools() -> list[dict]:
@@ -191,18 +190,19 @@ async def code_chat_stream(
             primary_provider=primary_provider,
             api_keys=api_keys,
         )
+    from shared.cancellation import registry as cancel_registry
+
+    # The turn's cancellation flag, shared with /agent/stop and with the bus:
+    # a client disconnect (aborted fetch, closed tab) closes the bus, which
+    # cancels the turn even if the explicit stop request never arrived.
+    cid = conversation_id or str(uuid.uuid4())
+    cancel_token = cancel_registry.register(cid)
     # Bounded and lossy for progress ticks: the native scanner's threads push
     # through here while holding the GIL, so this must never block or grow.
-    bus = EventBus()
+    bus = EventBus(on_close=cancel_token.cancel)
 
     def run_agent():
         try:
-            cid = conversation_id or str(uuid.uuid4())
-            agent_job.set_current_cid(cid)
-            try:
-                agent_job.ensure_job(cid)
-            except Exception:
-                pass
             history = conv_store.load(cid)
 
             # Build user message with attachment context
@@ -275,6 +275,7 @@ async def code_chat_stream(
                     base_url=None,
                 )
                 agent.set_event_sink(saving_sink)
+                agent.set_cancel_token(cancel_token)
                 result: AgentResult = agent.run(user_content)
                 conv_store.save(cid, agent.log.events)
                 bus.push({
@@ -304,8 +305,10 @@ async def code_chat_stream(
                     config=config,
                     event_sink=bus.push,
                     disabled_tools=disabled_tools,
+                    plan_key=cid,
                 )
                 agent.set_event_sink(saving_sink)
+                agent.set_cancel_token(cancel_token)
                 agent.load_history(history)
                 result: AgentResult = agent.run(user_content)
                 conv_store.save(cid, agent.log.events)
@@ -340,11 +343,20 @@ async def code_chat_stream(
                 "attempts": 0,
                 "verification_status": None,
                 "verification_reason": None,
-                "conversation_id": conversation_id,
+                "conversation_id": cid,
             })
         finally:
+            cancel_registry.unregister(cid, cancel_token)
+            # Close the turn's job so no child process outlives the turn.
+            from shared import agent_job
+
+            agent_job.cleanup_job(cid)
             # Wake the consumer even if the agent died without a final event.
             bus.push({"type": DONE})
+
+    # Send handshake event first with schema version
+    from server.event_bus import make_handshake_event
+    bus.push(make_handshake_event())
 
     thread = threading.Thread(target=run_agent, daemon=True)
     thread.start()
@@ -363,6 +375,7 @@ def code_chat_route(
     config=None,
     disabled_tools=None,
     attachments=None,
+    conversation_id: str | None = None,
 ) -> dict:
     log.info(f"[CODE AGENT] route called - primary={primary_provider}:{primary_model}")
     try:
@@ -375,6 +388,7 @@ def code_chat_route(
             primary_provider=primary_provider,
             config=config,
             disabled_tools=disabled_tools,
+            plan_key=conversation_id,
         )
     except ValueError as e:
         log.warning(f"[CODE AGENT] Failed to create agent: {e}")

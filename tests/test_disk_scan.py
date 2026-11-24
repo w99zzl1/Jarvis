@@ -276,7 +276,7 @@ def run_all(tmp):
     check("is flat, not a tree", "└──" not in text and "├──" not in text)
     path_lines = [
         ln for ln in text.splitlines()
-        if ln.startswith(tmp) and ln != f"{tmp}  [" and not ln.startswith("[скрыто")
+        if ln.startswith(tmp) and ln != f"{tmp}  [" and not ln.startswith("[HIDDEN:")
     ]
     check("every path line is absolute",
           all(ln.split("  [")[0].startswith(tmp) for ln in path_lines),
@@ -328,13 +328,13 @@ def run_all(tmp):
               f"got {r.report.hidden_nodes}")
 
         text = format_report(r)
-        hidden_lines = [ln for ln in text.splitlines() if ln.startswith("[скрыто в ")]
+        hidden_lines = [ln for ln in text.splitlines() if ln.startswith("[HIDDEN: ")]
         check("hidden line is rendered", len(hidden_lines) == 1,
               f"got {hidden_lines}")
         check("hidden line names its folder", ratio_root in hidden_lines[0],
               f"got {hidden_lines}")
         check("hidden line says it is under the ratio",
-              "файлов меньше порога" in hidden_lines[0], f"got {hidden_lines}")
+              "under min_ratio" in hidden_lines[0], f"got {hidden_lines}")
 
         r0 = scan(ratio_root, max_depth=2, min_ratio=0.0, prune_junk=False)
         es0 = entries_of(r0.report)
@@ -377,7 +377,7 @@ def run_all(tmp):
         check("the hidden line exists even at 0 B", len(hidden) == 1,
               f"got {len(hidden)}")
         lines = [ln for ln in format_report(r).splitlines()
-                 if ln.startswith("[скрыто в ")]
+                 if ln.startswith("[HIDDEN: ")]
         check("the 0 B line is rendered", len(lines) == 1, f"got {lines}")
         check("the 0 B line says 0 B", "0 B" in lines[0], f"got {lines}")
     finally:
@@ -417,7 +417,7 @@ def run_all(tmp):
     case("tool result carries flat text and a summary")
     from agents.code.tools.active.disk_tree import DiskTreeTool
     tool = DiskTreeTool(REPO)
-    res = tool.execute(path="src-tauri", max_depth=2, max_nodes=50, timeout=60)
+    res = tool.execute({"path": "src-tauri", "max_depth": 2, "max_nodes": 50, "timeout": 60})
     check("tool succeeded", res.status == "success", res.error or "")
     check("model text is not JSON",
           not res.to_text().lstrip().startswith("{"), res.to_text()[:60])
@@ -428,13 +428,13 @@ def run_all(tmp):
     check("structured data is still available", res.data.get("nodes_scanned", 0) > 0)
     check("total bytes are reported", res.data.get("total_bytes", 0) > 0)
 
-    bad = tool.execute(path=os.path.join(REPO, "does-not-exist-here"))
+    bad = tool.execute({"path": os.path.join(REPO, "does-not-exist-here")})
     check("missing path fails cleanly", bad.status == "failure", bad.status)
     check("missing path has no report", not bad.to_text().startswith("PATHS"))
 
     case("progress reaches the tool")
     seen = []
-    tool.execute(path="src-tauri", max_depth=2, max_nodes=50, timeout=60,
+    tool.execute({"path": "src-tauri", "max_depth": 2, "max_nodes": 50, "timeout": 60},
                  on_progress=seen.append)
     check("tool forwards progress", len(seen) >= 1, f"got {len(seen)}")
     check("forwarded sample ends at 100%",
@@ -510,7 +510,7 @@ def run_all(tmp):
     case("the scan path cache is in the system prompt")
     cache_log = EventLog()
     cache_log.add_user("scan my disk")
-    tool.execute(path="src-tauri", max_depth=3, max_nodes=120, timeout=60)
+    tool.execute({"path": "src-tauri", "max_depth": 3, "max_nodes": 120, "timeout": 60})
     built = ContextBuilder(cache_log, "SYS").build()
     system = built[0]["content"]
     check("the model is told which paths are known",
@@ -718,15 +718,11 @@ def run_all(tmp):
     check("sse keeps the call id", ev and ev["call_id"] == "c9")
     check("unknown events still map to None",
           _map_to_sse_event({"type": "nothing_like_this"}) is None)
-    # A raw sample straight from Rust has no envelope; the planned move to native
-    # Tauri events will send exactly this shape.
-    raw = _map_to_sse_event({"nodes": 12, "bytes": 34, "queued": 5,
-                             "percent": 7.5, "elapsed": 0.2, "done": False})
-    check("a bare scanner sample still streams",
-          raw is not None and raw["type"] == "tool_progress" and raw["percent"] == 7.5,
-          f"got {raw}")
-    check("a progress sample is not confused with something else",
-          _map_to_sse_event({"percent": 1, "error": "x"}) is None)
+    # Progress must be explicitly typed. Guessing from field combinations made
+    # unrelated events with a `percent` key render as scan progress.
+    check("untyped samples are ignored",
+          _map_to_sse_event({"nodes": 12, "bytes": 34, "queued": 5,
+                             "percent": 7.5, "elapsed": 0.2, "done": False}) is None)
 
     case("the event bus cannot stall the scanner")
     from server.event_bus import DONE, LOSSY, EventBus, sse_stream

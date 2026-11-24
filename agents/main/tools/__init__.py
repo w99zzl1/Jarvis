@@ -1,6 +1,6 @@
 # Main Jarvis Tools
 from .registry import ToolRegistry, GetToolsTool
-from .shell import RunCmdTool, RunPowerShellTool
+from .shell import RunPowerShellTool
 from .web_search import WebSearchTool
 from .read import ReadTool
 from .write import WriteTool
@@ -14,7 +14,6 @@ from .search_files import SearchFilesTool
 __all__ = [
     "ToolRegistry",
     "GetToolsTool",
-    "RunCmdTool",
     "RunPowerShellTool",
     "WebSearchTool",
     "ReadTool",

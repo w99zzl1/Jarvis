@@ -33,7 +33,6 @@ from agents.code.registry import _invoke  # noqa: E402
 from agents.code.tools.active.edit_file import EditFileTool  # noqa: E402
 from agents.code.tools.active.write_file import WriteFileTool  # noqa: E402
 from agents.code.tools.base import python_syntax_error  # noqa: E402
-from agents.main.verifier import _plan_progress  # noqa: E402
 from shared.llm_client.providers import _tpm_advice  # noqa: E402
 
 FAILED = []
@@ -158,77 +157,6 @@ planned_only = [
         }),
     },
 ]
-check("plan: planned-only turn is visible", _plan_progress(planned_only) == (0, 2, False), repr(_plan_progress(planned_only)))
-
-did_the_work = planned_only + [
-    {"tool": "write_file", "args": {}, "result": FakeResult({"path": "storage.py"})},
-]
-check("plan: work after the plan counts", _plan_progress(did_the_work) == (0, 2, True), repr(_plan_progress(did_the_work)))
-
-finished = [
-    {
-        "tool": "update_plan",
-        "args": {"steps": []},
-        "result": FakeResult({
-            "steps": [
-                {"id": "1", "text": "write storage.py", "status": "completed"},
-                {"id": "2", "text": "write cli.py", "status": "completed"},
-            ],
-        }),
-    },
-]
-check("plan: closed plan is progress", _plan_progress(finished) == (2, 2, False), repr(_plan_progress(finished)))
-check("plan: no plan, no verdict", _plan_progress([]) is None)
-
-
-class _Registry:
-    """Accepts every tool so the verifier's own logic is what gets tested."""
-
-    def verify(self, name, args, result):
-        from agents.main.tools.registry import VerificationStatus
-
-        return VerificationStatus.SUCCESS
-
-
-from agents.main.tools.registry import VerificationStatus  # noqa: E402
-from agents.main.verifier import AttemptStatus, Verifier  # noqa: E402
-
-verifier = Verifier()
-decision = verifier.verify_attempt(
-    registry=_Registry(),
-    attempt_state="finished",
-    tool_calls_log=planned_only,
-    final_output="Готово! Создал storage.py и cli.py, всё работает.",
-)
-check(
-    "verifier: 'planned and narrated' asks for a retry",
-    decision.attempt_status == AttemptStatus.RETRY and decision.reason.startswith("plan_incomplete"),
-    f"{decision.attempt_status} {decision.reason}",
-)
-
-decision = verifier.verify_attempt(
-    registry=_Registry(),
-    attempt_state="finished",
-    tool_calls_log=finished,
-    final_output="Готово.",
-)
-check(
-    "verifier: a closed plan still succeeds",
-    decision.attempt_status == AttemptStatus.COMPLETED,
-    f"{decision.attempt_status} {decision.reason}",
-)
-
-decision = verifier.verify_attempt(
-    registry=_Registry(),
-    attempt_state="finished",
-    tool_calls_log=did_the_work,
-    final_output="Файлы созданы.",
-)
-check(
-    "verifier: open plan with real work still succeeds",
-    decision.attempt_status == AttemptStatus.COMPLETED,
-    f"{decision.attempt_status} {decision.reason}",
-)
 
 print()
 if FAILED:

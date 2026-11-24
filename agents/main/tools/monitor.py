@@ -3,7 +3,7 @@ import subprocess
 import threading
 import queue
 
-from .registry import Tool, ToolResult, VerificationStatus
+from .registry import Tool, ToolResult
 
 monitor_alerts = queue.Queue()
 bg_procs = []
@@ -101,8 +101,3 @@ while($true) {{
             return _start_background_ps(script)
 
         return ToolResult(status="error", error=f"Unknown action: {action}")
-
-    def verify(self, args: dict, result: ToolResult) -> VerificationStatus:
-        if result.status != "success":
-            return VerificationStatus.FAILED
-        return VerificationStatus.SUCCESS
